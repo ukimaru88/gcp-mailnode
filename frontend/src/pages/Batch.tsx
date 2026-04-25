@@ -49,10 +49,9 @@ const ASIA_REGIONS = [
 ]
 
 // IP 前缀过滤选项
-// - whitelist: 只保留 IPPrefixFilter 里开头的（强约束）
-// - blacklist: 排除 IPPrefixExclude 里开头的，其余全保留（推荐——GCP 日本区 34.x 声誉较差）
+// - blacklist: 排除 IPPrefixExclude 里开头的，其余全保留（默认——GCP 日本区 34.x 声誉较差）
 // - all: 不过滤，仅靠 DNSBL
-type IPPrefixMode = 'whitelist_104_106' | 'whitelist_104' | 'blacklist' | 'all'
+type IPPrefixMode = 'blacklist' | 'all'
 
 interface LogLine {
   slot?: number
@@ -335,11 +334,9 @@ export default function Batch() {
     if (selectedRegions.length === 0) { toast('warning', '请至少选择一个 region'); return }
 
     // 把前端模式映射成后端两个列表
-    let ipPrefixFilter: string[] = []
+    const ipPrefixFilter: string[] = []
     let ipPrefixExclude: string[] = []
-    if (ipPrefixMode === 'whitelist_104_106') ipPrefixFilter = ['104.', '106.']
-    else if (ipPrefixMode === 'whitelist_104') ipPrefixFilter = ['104.']
-    else if (ipPrefixMode === 'blacklist') {
+    if (ipPrefixMode === 'blacklist') {
       ipPrefixExclude = excludePrefixText
         .split(/[\s,，、]+/)
         .map(s => s.trim())
@@ -674,9 +671,7 @@ export default function Batch() {
                 <label className="block text-xs text-slate-400 mb-1.5">IP 前缀过滤</label>
                 <div className="space-y-1.5">
                   {([
-                    { v: 'blacklist', t: '排除指定前缀（推荐，默认排 34.）', hint: '命中黑名单就释放重申，直到筛够目标数量' },
-                    { v: 'whitelist_104_106', t: '只要 104 / 106 开头', hint: '强约束：遇到其他前缀就释放重申' },
-                    { v: 'whitelist_104', t: '只要 104 开头', hint: '更强约束' },
+                    { v: 'blacklist', t: '排除指定前缀（默认排 34.）', hint: '命中黑名单就释放重申，直到筛够目标数量' },
                     { v: 'all', t: '所有前缀，仅靠 DNSBL', hint: '不看前缀，DNSBL 干净就留' },
                   ] as { v: IPPrefixMode; t: string; hint: string }[]).map(o => (
                     <label key={o.v} className="flex items-start gap-2 px-2 py-1.5 bg-slate-900 border border-slate-700 rounded-md text-sm cursor-pointer hover:border-indigo-500">
