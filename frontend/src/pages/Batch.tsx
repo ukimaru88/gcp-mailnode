@@ -16,8 +16,6 @@ import {
   // @ts-ignore
   BatchSetPTR,
   // @ts-ignore
-  ListPersonas,
-  // @ts-ignore
   PruneBatchIPs,
   // @ts-ignore
   ClearDNSBLCache,
@@ -178,8 +176,6 @@ export default function Batch() {
 
   // Step 3 搭建邮局 Modal
   const [deployModalOpen, setDeployModalOpen] = useState(false)
-  const [personas, setPersonas] = useState<any[]>([])
-  const [personaID, setPersonaID] = useState('')
   const [hideClientIP, setHideClientIP] = useState(true)
   const [domainIPText, setDomainIPText] = useState('')
   const [aliID, setAliID] = useState('')
@@ -278,15 +274,6 @@ export default function Batch() {
       }
     } catch (e: any) {
       if (!silent) toast('error', '刷新失败: ' + (e?.message || e))
-    }
-  }
-
-  const refreshPersonas = async () => {
-    try {
-      const list = await ListPersonas()
-      setPersonas(list || [])
-    } catch (e: any) {
-      toast('error', '加载 Persona 失败: ' + (e?.message || e))
     }
   }
 
@@ -422,7 +409,6 @@ export default function Batch() {
 
   // === Step 3 操作（搭建邮局）===
   const openStageCModal = async () => {
-    await refreshPersonas()
     setDeployModalOpen(true)
   }
 
@@ -467,7 +453,6 @@ export default function Batch() {
         domain_ip_map: map,
         aliyun_cred_id: aliID,
         hide_client_ip: hideClientIP,
-        persona_id: personaID,
       } as any)
       if (taskID) setCurrentTaskID(taskID)
       toast('success', `阶段 C 已启动${taskID ? `：${taskID}` : ''}`)
@@ -491,8 +476,6 @@ export default function Batch() {
       toast('error', '提交失败: ' + (e?.message || e))
     }
   }
-
-  const selectedPersona = personas.find(p => p.id === personaID)
 
   return (
     <div className="p-6 h-full overflow-auto">
@@ -1043,36 +1026,6 @@ export default function Batch() {
                 <div className="text-xs text-slate-500">移除 Received 链头部真实 IP，写入伪造链</div>
               </div>
             </label>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Persona（伪造身份）</label>
-              <select className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
-                      value={personaID} onChange={e => setPersonaID(e.target.value)}>
-                <option value="">-- 不伪造 --</option>
-                {personas.map(p => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}{p.is_preset ? ' [预设]' : ''}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {selectedPersona && (
-              <div className="bg-slate-950 border border-slate-700/50 rounded-md p-3 space-y-2">
-                <div>
-                  <div className="text-xs text-slate-500 mb-0.5">Received 模板</div>
-                  <pre className="text-xs text-slate-300 font-mono whitespace-pre-wrap break-all">{selectedPersona.received_template || '(空)'}</pre>
-                </div>
-                <div>
-                  <div className="text-xs text-slate-500 mb-0.5">User-Agent</div>
-                  <div className="text-xs text-slate-300 font-mono break-all">{selectedPersona.user_agent || '(空)'}</div>
-                </div>
-                <div>
-                  <div className="text-xs text-slate-500 mb-0.5">X-Mailer</div>
-                  <div className="text-xs text-slate-300 font-mono break-all">{selectedPersona.x_mailer || '(空)'}</div>
-                </div>
-              </div>
-            )}
 
             <div className="flex justify-end gap-2 pt-2">
               <button onClick={() => setDeployModalOpen(false)}

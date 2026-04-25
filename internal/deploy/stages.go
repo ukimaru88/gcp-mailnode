@@ -1011,12 +1011,9 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, fqdn, subdomain, domain, roo
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
 	v.HideClientIP = opts.HideClientIP
-	if persona != nil {
-		v.PersonaReceivedTemplate = persona.ReceivedTemplate
-		v.PersonaUserAgent = persona.UserAgent
-		v.PersonaXMailer = persona.XMailer
-		v.PersonaExtraHeadersLuaTable = BuildPersonaExtraHeadersLua(persona.ExtraHeaders)
-	}
+	// Persona 伪造完全在 brutal-mailer 侧完成，KumoMTA 只做透明中继；
+	// persona 参数保留是为了不破坏外部调用签名，这里不写入任何 persona 头。
+	_ = persona
 	installScript, err := RenderInstallKumoMTA(v)
 	if err != nil {
 		return err
