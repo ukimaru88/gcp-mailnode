@@ -10,6 +10,7 @@ import Resources from './pages/Resources'
 import Export from './pages/Export'
 import LiveLog from './pages/LiveLog'
 import Personas from './pages/Personas'
+import Extract from './pages/Extract'
 
 // keepAlive：所有页面一次性挂载，通过 display 切换可见性，tab 切换时组件不卸载，state 不丢。
 const PAGES: { path: string; el: JSX.Element }[] = [
@@ -21,6 +22,7 @@ const PAGES: { path: string; el: JSX.Element }[] = [
   { path: '/blackseg',    el: <BlackSeg /> },
   { path: '/personas',    el: <Personas /> },
   { path: '/log',         el: <LiveLog /> },
+  { path: '/extract',     el: <Extract /> },
 ]
 
 function KeepAlivePages() {
