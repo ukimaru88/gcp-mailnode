@@ -532,17 +532,18 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 			}
 		}
 		createdInfo, createErr = gcpClient.CreateInstance(ctx, gcp.InstanceSpec{
-			Name:          instanceName,
-			Zone:          tryZone,
-			MachineType:   machineType,
-			ImageFamily:   imageFamily,
-			ImageProject:  imageProject,
-			DiskSizeGB:    diskSize,
-			DiskType:      diskType,
-			Tags:          mergeMailNodeTag(tmpl.Tags),
-			StartupScript: startupScript,
-			StaticIP:      ip,
-			NetworkName:   "default",
+			Name:              instanceName,
+			Zone:              tryZone,
+			MachineType:       machineType,
+			ImageFamily:       imageFamily,
+			ImageProject:      imageProject,
+			DiskSizeGB:        diskSize,
+			DiskType:          diskType,
+			Tags:              mergeMailNodeTag(tmpl.Tags),
+			StartupScript:     startupScript,
+			StaticIP:          ip,
+			NetworkName:       "default",
+			ProvisioningModel: tmpl.ProvisioningModel,
 		})
 		if createErr == nil {
 			zone = tryZone

@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS vps_instances (
     machine_type TEXT NOT NULL,
     status TEXT DEFAULT 'pending',
     ip TEXT DEFAULT '',
+    internal_ip TEXT DEFAULT '',
     fqdn TEXT DEFAULT '',
     root_password TEXT DEFAULT '',
     deploy_status TEXT DEFAULT 'pending',
@@ -215,9 +216,18 @@ func Init(dataDir string) error {
 		`ALTER TABLE vps_instances ADD COLUMN ptr_status TEXT DEFAULT 'none'`,
 		`ALTER TABLE vps_instances ADD COLUMN persona_id TEXT DEFAULT ''`,
 		`ALTER TABLE vps_instances ADD COLUMN hide_client_ip INTEGER DEFAULT 1`,
+		`ALTER TABLE vps_instances ADD COLUMN internal_ip TEXT DEFAULT ''`,
 		// v0.1.27：部署类型 kumomta（纯发信）或 mailcow（收发一体）
 		`ALTER TABLE vps_templates ADD COLUMN deploy_type TEXT DEFAULT 'kumomta'`,
 		`ALTER TABLE vps_instances ADD COLUMN deploy_type TEXT DEFAULT 'kumomta'`,
+		// v0.1.54：Spot VM + 多 NIC 多 IP
+		`ALTER TABLE vps_templates ADD COLUMN provisioning_model TEXT DEFAULT 'STANDARD'`,
+		`ALTER TABLE vps_templates ADD COLUMN nic_count INTEGER DEFAULT 1`,
+		`ALTER TABLE vps_instances ADD COLUMN provisioning_model TEXT DEFAULT 'STANDARD'`,
+		`ALTER TABLE vps_instances ADD COLUMN nic_count INTEGER DEFAULT 1`,
+		`ALTER TABLE vps_instances ADD COLUMN additional_ips_json TEXT DEFAULT '[]'`,
+		`ALTER TABLE static_ips ADD COLUMN nic_index INTEGER DEFAULT 0`,
+		`ALTER TABLE static_ips ADD COLUMN slot_group TEXT DEFAULT ''`,
 	}
 	for _, m := range migrations {
 		if _, err := conn.Exec(m); err != nil {

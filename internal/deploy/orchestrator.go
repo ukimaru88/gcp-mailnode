@@ -64,6 +64,9 @@ type VPSTemplate struct {
 	MetadataScript string
 	RootPassword   string
 	DeployType     string // kumomta（默认）/ mailcow
+	// v0.1.54
+	ProvisioningModel string // STANDARD（默认）/ SPOT
+	NICCount          int    // 1（默认）或 8 —— 仅 Batch 1 暂不消费，留给 Batch 2 多 NIC
 }
 
 // batchState 运行中的批量任务状态
@@ -446,17 +449,18 @@ func runSlot(
 	}
 
 	spec := gcp.InstanceSpec{
-		Name:          instanceName,
-		Zone:          zone,
-		MachineType:   machineType,
-		ImageFamily:   imageFamily,
-		ImageProject:  imageProject,
-		DiskSizeGB:    diskSize,
-		DiskType:      diskType,
-		Tags:          mergeMailNodeTag(tmpl.Tags),
-		StartupScript: startupScript,
-		StaticIP:      chosenAddr.IP,
-		NetworkName:   "default",
+		Name:              instanceName,
+		Zone:              zone,
+		MachineType:       machineType,
+		ImageFamily:       imageFamily,
+		ImageProject:      imageProject,
+		DiskSizeGB:        diskSize,
+		DiskType:          diskType,
+		Tags:              mergeMailNodeTag(tmpl.Tags),
+		StartupScript:     startupScript,
+		StaticIP:          chosenAddr.IP,
+		NetworkName:       "default",
+		ProvisioningModel: tmpl.ProvisioningModel,
 	}
 
 	log("INFO", "创建 VM: name=%s zone=%s mt=%s", instanceName, zone, machineType)
@@ -468,14 +472,12 @@ func runSlot(
 		_ = gcpClient.ReleaseStaticAddress(context.Background(), region, chosenAddr.Name)
 		return err
 	}
-	_ = inst
-
 	vpsID := uuid.NewString()
 	_, err = db.ExecContext(ctx,
-		`INSERT INTO vps_instances (id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, fqdn, root_password, deploy_status, aliyun_cred_id, domain)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO vps_instances (id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, internal_ip, fqdn, root_password, deploy_status, aliyun_cred_id, domain)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		vpsID, gcpCredID, instanceName, instanceName, region, zone, machineType, "pending",
-		chosenAddr.IP, fqdn, rootPassword, "pending", req.AliyunCredID, domain)
+		chosenAddr.IP, inst.InternalIP, fqdn, rootPassword, "pending", req.AliyunCredID, domain)
 	if err != nil {
 		log("WARN", "记录 vps_instances 失败: %v", err)
 	}
@@ -504,11 +506,16 @@ func runSlot(
 
 	// 等 VM running
 	log("INFO", "等待 VM running...")
-	if _, err := gcpClient.WaitForRunning(ctx, zone, instanceName, 5*time.Minute); err != nil {
+	runningInfo, err := gcpClient.WaitForRunning(ctx, zone, instanceName, 5*time.Minute)
+	if err != nil {
 		cleanup(err)
 		return err
 	}
-	_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET status='running' WHERE id=?`, vpsID)
+	internalIP := strings.TrimSpace(runningInfo.InternalIP)
+	if internalIP == "" {
+		internalIP = strings.TrimSpace(inst.InternalIP)
+	}
+	_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET status='running', internal_ip=? WHERE id=?`, internalIP, vpsID)
 	_, _ = db.ExecContext(ctx, `UPDATE static_ips SET status='in_use', bound_instance_id=? WHERE id=?`, vpsID, staticIPID)
 
 	// 5. SSH 拨测
@@ -548,7 +555,17 @@ func runSlot(
 	}
 
 	// 7. 部署 KumoMTA
-	v := BuildDeployVars(domain, subdomain, chosenAddr.IP)
+	if internalIP == "" {
+		if detected, derr := detectRemoteInternalIP(ctx, sshCfg); derr == nil {
+			internalIP = detected
+			_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET internal_ip=? WHERE id=?`, internalIP, vpsID)
+			log("INFO", "检测到 VPS 内网 IP: %s", internalIP)
+		} else {
+			log("WARN", "检测内网 IP 失败，临时回退到外网 IP（KumoMTA source_address 可能失败）: %v", derr)
+			internalIP = chosenAddr.IP
+		}
+	}
+	v := BuildDeployVars(domain, subdomain, internalIP)
 
 	installScript, err := RenderInstallKumoMTA(v)
 	if err != nil {
@@ -608,6 +625,11 @@ chmod +x /tmp/deploy_config.sh
 	log("INFO", "远程执行 deploy_config.sh...")
 	if _, err := ssh.RunCommand(ctx, sshCfg, cmd); err != nil {
 		log("ERROR", "deploy_config 失败: %v", err)
+		cleanup(err)
+		return err
+	}
+	if err := kumoMTASelfCheck(ctx, sshCfg, v); err != nil {
+		log("ERROR", "KumoMTA self-check 失败: %v", err)
 		cleanup(err)
 		return err
 	}
@@ -737,30 +759,36 @@ func loadTemplate(id string) (VPSTemplate, error) {
 		return VPSTemplate{}, fmt.Errorf("数据库未就绪")
 	}
 	var (
-		name, regionsJSON, machineType, imageFamily, imageProject, diskType, tagsJSON, metadataScript, rootPwd, deployType string
-		autoSpread                                                                                                         int
-		diskSize                                                                                                           int64
+		name, regionsJSON, machineType, imageFamily, imageProject, diskType, tagsJSON, metadataScript, rootPwd, deployType, provisioningModel string
+		autoSpread, nicCount                                                                                                                  int
+		diskSize                                                                                                                              int64
 	)
 	row := db.QueryRow(
-		`SELECT name, regions_json, auto_spread, machine_type, image_family, image_project, disk_size_gb, COALESCE(disk_type,'pd-balanced'), tags_json, COALESCE(metadata_script,''), root_password, COALESCE(deploy_type,'kumomta') FROM vps_templates WHERE id=?`, id)
-	if err := row.Scan(&name, &regionsJSON, &autoSpread, &machineType, &imageFamily, &imageProject, &diskSize, &diskType, &tagsJSON, &metadataScript, &rootPwd, &deployType); err != nil {
+		`SELECT name, regions_json, auto_spread, machine_type, image_family, image_project, disk_size_gb,
+		        COALESCE(disk_type,'pd-balanced'), tags_json, COALESCE(metadata_script,''), root_password,
+		        COALESCE(deploy_type,'kumomta'),
+		        COALESCE(provisioning_model,'STANDARD'), COALESCE(nic_count,1)
+		   FROM vps_templates WHERE id=?`, id)
+	if err := row.Scan(&name, &regionsJSON, &autoSpread, &machineType, &imageFamily, &imageProject, &diskSize, &diskType, &tagsJSON, &metadataScript, &rootPwd, &deployType, &provisioningModel, &nicCount); err != nil {
 		if err == sql.ErrNoRows {
 			return VPSTemplate{}, fmt.Errorf("未找到模板 id=%s", id)
 		}
 		return VPSTemplate{}, err
 	}
 	tmpl := VPSTemplate{
-		ID:             id,
-		Name:           name,
-		AutoSpread:     autoSpread == 1,
-		MachineType:    machineType,
-		ImageFamily:    imageFamily,
-		ImageProject:   imageProject,
-		DiskSizeGB:     diskSize,
-		DiskType:       diskType,
-		MetadataScript: metadataScript,
-		RootPassword:   rootPwd,
-		DeployType:     deployType,
+		ID:                id,
+		Name:              name,
+		AutoSpread:        autoSpread == 1,
+		MachineType:       machineType,
+		ImageFamily:       imageFamily,
+		ImageProject:      imageProject,
+		DiskSizeGB:        diskSize,
+		DiskType:          diskType,
+		MetadataScript:    metadataScript,
+		RootPassword:      rootPwd,
+		DeployType:        deployType,
+		ProvisioningModel: provisioningModel,
+		NICCount:          nicCount,
 	}
 	if regionsJSON != "" {
 		_ = json.Unmarshal([]byte(regionsJSON), &tmpl.Regions)

@@ -12,7 +12,10 @@ const REGION_OPTIONS = [
   { code: 'asia-southeast1', label: '新加坡' },
 ]
 
-const MACHINE_TYPES = ['e2-micro', 'e2-small', 'e2-medium', 'e2-standard-2', 'e2-standard-4', 'n1-standard-1']
+const MACHINE_TYPES = [
+  'e2-micro', 'e2-small', 'e2-medium', 'e2-standard-2', 'e2-standard-4',
+  'n1-standard-1', 'n1-standard-2', 'n1-standard-4', 'n1-standard-8',  // n1-standard-8 Spot 折扣最高
+]
 
 const DISK_TYPES: { code: string; label: string }[] = [
   { code: 'pd-standard', label: 'pd-standard（HDD，最便宜）' },
@@ -34,6 +37,8 @@ interface FormState {
   metadata_script: string
   root_password: string
   deploy_type: string
+  provisioning_model: string  // STANDARD / SPOT
+  nic_count: number           // 1 / 8（Batch 2 启用）
   is_preset: boolean
 }
 
@@ -51,6 +56,8 @@ const emptyForm = (): FormState => ({
   metadata_script: '',
   root_password: '',
   deploy_type: 'kumomta',
+  provisioning_model: 'STANDARD',
+  nic_count: 1,
   is_preset: false,
 })
 
@@ -90,6 +97,8 @@ export default function Templates() {
       metadata_script: t.metadata_script,
       root_password: t.root_password,
       deploy_type: (t as any).deploy_type || 'kumomta',
+      provisioning_model: (t as any).provisioning_model || 'STANDARD',
+      nic_count: (t as any).nic_count || 1,
       is_preset: asCopy ? false : t.is_preset,
     })
     setOpen(true)
@@ -120,9 +129,11 @@ export default function Templates() {
         metadata_script: form.metadata_script,
         root_password: form.root_password,
         deploy_type: form.deploy_type || 'kumomta',
+        provisioning_model: form.provisioning_model || 'STANDARD',
+        nic_count: form.nic_count || 1,
         is_preset: false,
         created_at: null,
-      })
+      } as any)
       await SaveVPSTemplate(dto)
       toast('success', '已保存')
       setOpen(false)
@@ -282,6 +293,31 @@ export default function Templates() {
                     ? '建议 4GB+ 内存；禁用 ClamAV 节省 2GB；部署后通过 https://{FQDN}/ 管理，默认 admin/moohoo'
                     : 'KumoMTA 仅发信不收信；想收回信请改选 mailcow'}
                 </p>
+              </div>
+
+              <div className="col-span-2">
+                <label className="block text-xs text-slate-400 mb-1">计费模式</label>
+                <div className="flex gap-2">
+                  <label className={`flex-1 flex items-center gap-2 px-3 py-2 border rounded-md cursor-pointer ${form.provisioning_model === 'STANDARD' ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-200' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}`}>
+                    <input type="radio" className="accent-indigo-500" checked={form.provisioning_model === 'STANDARD'} onChange={() => setForm({ ...form, provisioning_model: 'STANDARD' })} />
+                    <div>
+                      <div className="text-sm">按需 (STANDARD)</div>
+                      <div className="text-[10px] text-slate-500">稳定不被抢占，按官方原价</div>
+                    </div>
+                  </label>
+                  <label className={`flex-1 flex items-center gap-2 px-3 py-2 border rounded-md cursor-pointer ${form.provisioning_model === 'SPOT' ? 'bg-amber-500/20 border-amber-500/50 text-amber-200' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}`}>
+                    <input type="radio" className="accent-amber-500" checked={form.provisioning_model === 'SPOT'} onChange={() => setForm({ ...form, provisioning_model: 'SPOT' })} />
+                    <div>
+                      <div className="text-sm">⚡ Spot（73% off）</div>
+                      <div className="text-[10px] text-slate-500">东京 n1 折扣最高，可被抢占（30 秒预通知 → 删除实例）</div>
+                    </div>
+                  </label>
+                </div>
+                {form.provisioning_model === 'SPOT' && (
+                  <p className="text-[10px] text-amber-400/80 mt-1">
+                    ⚠ Spot 抢占时实例直接 DELETE（不是 STOP）。3 天即抛业务模式适合，需要长时间稳定的不要选。
+                  </p>
+                )}
               </div>
 
               <div>
