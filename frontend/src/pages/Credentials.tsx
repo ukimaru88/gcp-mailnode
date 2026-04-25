@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Plus, TestTube2, Trash2, X, KeyRound, Cloud } from 'lucide-react'
+import { useEffect, useState, Fragment } from 'react'
+import { Plus, TestTube2, Trash2, X, KeyRound, Cloud, Shield } from 'lucide-react'
 import {
   AddGCPCredentialADC,
   AddGCPCredentialGcloud,
@@ -15,6 +15,12 @@ import {
   TestAliyunCredential,
   DeleteAliyunCredential,
   SetAliyunCredentialEnabled,
+  // @ts-ignore - bindings 会在 wails build 时重新生成
+  GetFirewallAllowlist,
+  // @ts-ignore
+  UpdateFirewallAllowlist,
+  // @ts-ignore
+  RestoreLegacyFirewall,
 } from '../../wailsjs/go/main/App'
 import { main } from '../../wailsjs/go/models'
 import { useToast } from '../components/Toast'
@@ -51,6 +57,84 @@ export default function Credentials() {
   const [saJSON, setSaJSON] = useState('')
   const [ak, setAk] = useState('')
   const [sk, setSk] = useState('')
+
+  // 防火墙白名单：哪个凭证 ID 当前展开 + 它的文本框内容（每行一个 CIDR）
+  const [fwOpen, setFwOpen] = useState<string | null>(null)
+  const [fwText, setFwText] = useState('')
+  const [fwBusy, setFwBusy] = useState(false)
+  const [fwDetecting, setFwDetecting] = useState(false)
+
+  const openFirewall = async (credID: string) => {
+    if (fwOpen === credID) { setFwOpen(null); return }
+    setFwOpen(credID)
+    setFwText('')
+    try {
+      const ips = (await GetFirewallAllowlist(credID)) as string[] | null
+      setFwText((ips || []).join('\n'))
+    } catch (e: any) {
+      toast('error', '读取白名单失败: ' + (e?.message || e))
+    }
+  }
+
+  const detectMyIP = async () => {
+    setFwDetecting(true)
+    try {
+      const r = await fetch('https://api.ipify.org?format=json')
+      const j = await r.json() as { ip?: string }
+      const ip = (j.ip || '').trim()
+      if (!ip) throw new Error('返回 IP 为空')
+      const cidr = ip.includes(':') ? `${ip}/128` : `${ip}/32`
+      // 追加到文本框（去重）
+      const lines = fwText.split('\n').map(s => s.trim()).filter(Boolean)
+      if (!lines.includes(cidr)) lines.push(cidr)
+      setFwText(lines.join('\n'))
+      toast('success', `已追加本机公网 IP：${cidr}`)
+    } catch (e: any) {
+      toast('error', '检测本机 IP 失败（可手动填写）：' + (e?.message || e))
+    } finally {
+      setFwDetecting(false)
+    }
+  }
+
+  const saveFirewall = async (credID: string) => {
+    const ips = fwText.split('\n').map(s => s.trim()).filter(Boolean)
+    if (ips.length === 0) {
+      if (!await confirmDlg({
+        message: '白名单为空将恢复全开（0.0.0.0/0）。继续？',
+        danger: false,
+      })) return
+    }
+    setFwBusy(true)
+    try {
+      await UpdateFirewallAllowlist(credID, ips)
+      if (ips.length === 0) {
+        toast('success', '已恢复全开')
+      } else {
+        toast('success', `白名单已下发（${ips.length} 条 + IAP 自救段）`)
+      }
+    } catch (e: any) {
+      toast('error', '下发失败: ' + (e?.message || e))
+    } finally {
+      setFwBusy(false)
+    }
+  }
+
+  const restoreFirewall = async (credID: string) => {
+    if (!await confirmDlg({
+      message: '确认恢复防火墙为全开（0.0.0.0/0）？\n所有端口将再次对全网开放，仅作为锁死自救使用。',
+      danger: true,
+    })) return
+    setFwBusy(true)
+    try {
+      await RestoreLegacyFirewall(credID)
+      setFwText('')
+      toast('success', '已恢复全开')
+    } catch (e: any) {
+      toast('error', '恢复失败: ' + (e?.message || e))
+    } finally {
+      setFwBusy(false)
+    }
+  }
 
   const refresh = async () => {
     try {
@@ -205,7 +289,8 @@ export default function Credentials() {
                   <tr><td colSpan={6} className="text-center px-3 py-6 text-slate-500">暂无凭证</td></tr>
                 )}
                 {gcpList.map(c => (
-                  <tr key={c.id} className="border-t border-slate-700/40 hover:bg-slate-800/50">
+                  <Fragment key={c.id}>
+                  <tr className="border-t border-slate-700/40 hover:bg-slate-800/50">
                     <td className="px-3 py-2 text-slate-200">{c.name}</td>
                     <td className="px-3 py-2 text-slate-300">{authTypeLabel(c.auth_type)}</td>
                     <td className="px-3 py-2 text-slate-300 font-mono text-xs">{c.project_id || '-'}</td>
@@ -223,12 +308,64 @@ export default function Credentials() {
                         <button className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-2 py-1 text-xs inline-flex items-center gap-1" onClick={() => testGCP(c.id)}>
                           <TestTube2 size={12} /> 测试
                         </button>
+                        <button
+                          className={`rounded-md px-2 py-1 text-xs inline-flex items-center gap-1 ${fwOpen === c.id ? 'bg-indigo-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
+                          onClick={() => openFirewall(c.id)}
+                          title="入站防火墙白名单"
+                        >
+                          <Shield size={12} /> 防火墙
+                        </button>
                         <button className="bg-red-600 hover:bg-red-500 text-white rounded-md px-2 py-1 text-xs inline-flex items-center gap-1" onClick={() => delGCP(c.id)}>
                           <Trash2 size={12} /> 删除
                         </button>
                       </div>
                     </td>
                   </tr>
+                  {fwOpen === c.id && (
+                    <tr className="border-t border-slate-700/40 bg-slate-900/40">
+                      <td colSpan={6} className="px-4 py-3">
+                        <div className="space-y-2">
+                          <div className="text-xs text-slate-400 leading-relaxed">
+                            入站白名单（每行一个 IP 或 CIDR）。<b className="text-slate-200">22 / 587</b> 等管理端口仅放行白名单 + GCP IAP 浏览器 SSH 段（<code className="text-slate-300">35.235.240.0/20</code>）；<b className="text-slate-200">25</b> 仍对全网开放（用于接收 bounce）；其余端口受 SourceRanges 限制等同于关闭。
+                            <br />
+                            留空保存 = 恢复全开。本机 IP 变化（拨号 / 4G / VPN）时需重新点"用我当前 IP 自动填"再下发。
+                          </div>
+                          <textarea
+                            className="w-full bg-slate-950/60 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-200 font-mono"
+                            rows={4}
+                            placeholder={'1.2.3.4\n10.0.0.0/24'}
+                            value={fwText}
+                            onChange={e => setFwText(e.target.value)}
+                          />
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-xs disabled:opacity-50"
+                              disabled={fwDetecting || fwBusy}
+                              onClick={detectMyIP}
+                            >
+                              {fwDetecting ? '检测中…' : '用我当前 IP 自动填'}
+                            </button>
+                            <button
+                              className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-md px-3 py-1.5 text-xs disabled:opacity-50"
+                              disabled={fwBusy}
+                              onClick={() => saveFirewall(c.id)}
+                            >
+                              {fwBusy ? '下发中…' : '保存并下发'}
+                            </button>
+                            <button
+                              className="bg-red-600 hover:bg-red-500 text-white rounded-md px-3 py-1.5 text-xs disabled:opacity-50"
+                              disabled={fwBusy}
+                              onClick={() => restoreFirewall(c.id)}
+                              title="把入站规则恢复为 0.0.0.0/0、删除 v3 mx-in 规则"
+                            >
+                              恢复全开
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
