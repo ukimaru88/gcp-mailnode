@@ -516,6 +516,7 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 	diskType := defaultString(tmpl.DiskType, "pd-balanced")
 
 	var zone string
+	var createdInfo gcp.InstanceInfo
 	var createErr error
 	for i, sfx := range []string{"a", "b", "c"} {
 		tryZone := region + "-" + sfx
@@ -530,7 +531,7 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 			case <-time.After(time.Duration(waitSecs) * time.Second):
 			}
 		}
-		_, createErr = gcpClient.CreateInstance(ctx, gcp.InstanceSpec{
+		createdInfo, createErr = gcpClient.CreateInstance(ctx, gcp.InstanceSpec{
 			Name:          instanceName,
 			Zone:          tryZone,
 			MachineType:   machineType,
@@ -574,9 +575,9 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 		deployType = "kumomta"
 	}
 	_, _ = db.ExecContext(ctx,
-		`INSERT INTO vps_instances (id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, fqdn, root_password, deploy_status, batch_id, deploy_type)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		vpsID, gcpCredID, instanceName, instanceName, region, zone, machineType, "pending", ip, "", rootPassword, "vps_pending", batchID, deployType)
+		`INSERT INTO vps_instances (id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, internal_ip, fqdn, root_password, deploy_status, batch_id, deploy_type)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		vpsID, gcpCredID, instanceName, instanceName, region, zone, machineType, "pending", ip, createdInfo.InternalIP, "", rootPassword, "vps_pending", batchID, deployType)
 	cleanup := func(reason error) {
 		msg := reason.Error()
 		log("WARN", "创建后的探测失败，清理 VM 和静态 IP: %v", reason)
@@ -593,11 +594,15 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 		_, _ = db.Exec(`UPDATE static_ips SET status='released', bound_instance_id='' WHERE id=?`, staticIPID)
 	}
 
-	if _, err := gcpClient.WaitForRunning(ctx, zone, instanceName, 5*time.Minute); err != nil {
+	runningInfo, err := gcpClient.WaitForRunning(ctx, zone, instanceName, 5*time.Minute)
+	if err != nil {
 		cleanup(err)
 		return err
 	}
-	_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET status='running' WHERE id=?`, vpsID)
+	if runningInfo.InternalIP != "" {
+		createdInfo.InternalIP = runningInfo.InternalIP
+	}
+	_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET status='running', internal_ip=? WHERE id=?`, createdInfo.InternalIP, vpsID)
 	_, _ = db.ExecContext(ctx, `UPDATE static_ips SET status='in_use', bound_instance_id=? WHERE id=?`, vpsID, staticIPID)
 
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
@@ -636,9 +641,9 @@ func createVPSOnly(ctx context.Context, batchID string, slot int, staticIPID, gc
 		}
 		time.Sleep(10 * time.Second)
 	}
-	err := fmt.Errorf("SSH 探测 10 次未成功")
-	cleanup(err)
-	return err
+	sshErr := fmt.Errorf("SSH 探测 10 次未成功")
+	cleanup(sshErr)
+	return sshErr
 }
 
 func StartStageC(ctx context.Context, req StageCRequest, onLog LogCallback) (string, error) {
@@ -721,13 +726,13 @@ func StartStageCWithPersona(ctx context.Context, req StageCRequest, personaSpec 
 				logC := func(level, format string, args ...interface{}) {
 					onLog(taskID, slot, level, fmt.Sprintf(format, args...))
 				}
-				var vpsID, rootPwd string
+				var vpsID, rootPwd, internalIP string
 				row := db.QueryRowContext(runCtx,
-					`SELECT id, root_password FROM vps_instances
+					`SELECT id, root_password, COALESCE(internal_ip,'') FROM vps_instances
 					 WHERE ip=? AND deploy_status IN ('vps_running','ptr_ready')
 					   AND status!='deleted'
-					 ORDER BY created_at DESC LIMIT 1`, ip)
-				if err := row.Scan(&vpsID, &rootPwd); err != nil {
+					   ORDER BY created_at DESC LIMIT 1`, ip)
+				if err := row.Scan(&vpsID, &rootPwd, &internalIP); err != nil {
 					if err == sql.ErrNoRows {
 						logC("ERROR", "IP %s 没有可进入 Stage C 的 VPS（仅允许 vps_running / ptr_ready，且未删除）", ip)
 					} else {
@@ -743,7 +748,7 @@ func StartStageCWithPersona(ctx context.Context, req StageCRequest, personaSpec 
 				if err := upsertAliyunRecordAndSyncLocal(runCtx, db, aliyunDNS, req.AliyunCredID, d, vpsID, dns.DnsRecordSpec{RR: "@", RecordType: "A", Value: ip}, logC); err != nil {
 					logC("WARN", "UpsertRecord A 失败: %v", err)
 				}
-				if err := deployMTAOnVPS(runCtx, vpsID, ip, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
+				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
 					logC("ERROR", "部署 KumoMTA 失败: %v", err)
 					_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='failed', deploy_error=? WHERE id=?`, err.Error(), vpsID)
 					atomic.AddInt64(&state.failed, 1)
@@ -945,9 +950,9 @@ func StartMTADeploy(ctx context.Context, vpsIDs []string, opts DeployOpts, perso
 				return
 			default:
 			}
-			var ip, fqdn, rootPwd, domain, aliyunCredID string
-			row := db.QueryRowContext(ctx, `SELECT ip, fqdn, root_password, domain, aliyun_cred_id FROM vps_instances WHERE id=?`, id)
-			if err := row.Scan(&ip, &fqdn, &rootPwd, &domain, &aliyunCredID); err != nil {
+			var ip, internalIP, fqdn, rootPwd, domain, aliyunCredID string
+			row := db.QueryRowContext(ctx, `SELECT ip, COALESCE(internal_ip,''), fqdn, root_password, domain, aliyun_cred_id FROM vps_instances WHERE id=?`, id)
+			if err := row.Scan(&ip, &internalIP, &fqdn, &rootPwd, &domain, &aliyunCredID); err != nil {
 				log("ERROR", "读取 VPS 失败: %v", err)
 				return
 			}
@@ -959,7 +964,7 @@ func StartMTADeploy(ctx context.Context, vpsIDs []string, opts DeployOpts, perso
 			aliyunDNS := getAli(aliyunCredID)
 			_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='mta_deploying', persona_id=?, hide_client_ip=? WHERE id=?`,
 				opts.PersonaID, boolToInt(opts.HideClientIP), id)
-			if err := deployMTAOnVPS(ctx, id, ip, fqdn, subdomain, domain, rootPwd, opts, persona, aliyunDNS, aliyunCredID, log); err != nil {
+			if err := deployMTAOnVPS(ctx, id, ip, internalIP, fqdn, subdomain, domain, rootPwd, opts, persona, aliyunDNS, aliyunCredID, log); err != nil {
 				_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='failed', deploy_error=? WHERE id=?`, err.Error(), id)
 				return
 			}
@@ -990,7 +995,7 @@ func StartMTADeployTask(ctx context.Context, vpsIDs []string, opts DeployOpts, p
 	})
 }
 
-func deployMTAOnVPS(ctx context.Context, vpsID, ip, fqdn, subdomain, domain, rootPwd string, opts DeployOpts, persona *PersonaSpec, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
+func deployMTAOnVPS(ctx context.Context, vpsID, ip, internalIP, fqdn, subdomain, domain, rootPwd string, opts DeployOpts, persona *PersonaSpec, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
 	db := store.DB()
 	if db == nil {
 		return fmt.Errorf("数据库未就绪")
@@ -1009,7 +1014,18 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, fqdn, subdomain, domain, roo
 	log("INFO", "部署类型=kumomta（纯发信 MTA）")
 
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
-	v := BuildDeployVars(domain, subdomain, ip)
+	internalIP = strings.TrimSpace(internalIP)
+	if internalIP == "" {
+		if detected, derr := detectRemoteInternalIP(ctx, sshCfg); derr == nil {
+			internalIP = detected
+			_, _ = db.ExecContext(ctx, `UPDATE vps_instances SET internal_ip=? WHERE id=?`, internalIP, vpsID)
+			log("INFO", "检测到 VPS 内网 IP: %s", internalIP)
+		} else {
+			log("WARN", "检测内网 IP 失败，临时回退到外网 IP（KumoMTA source_address 可能失败）: %v", derr)
+			internalIP = ip
+		}
+	}
+	v := BuildDeployVars(domain, subdomain, internalIP)
 	v.HideClientIP = opts.HideClientIP
 	// Persona 伪造完全在 brutal-mailer 侧完成，KumoMTA 只做透明中继；
 	// persona 参数保留是为了不破坏外部调用签名，这里不写入任何 persona 头。
@@ -1025,7 +1041,12 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, fqdn, subdomain, domain, roo
 	if err != nil {
 		return err
 	}
-	out, err := ssh.RunScript(ctx, sshCfg, dkimScript, nil)
+	// 流式回传 dkim_setup 的 stdout 到任务日志，便于失败时定位
+	out, err := ssh.RunScript(ctx, sshCfg, dkimScript, func(stream, line string) {
+		if line != "" {
+			log("INFO", "[dkim/%s] %s", stream, line)
+		}
+	})
 	if err != nil {
 		return fmt.Errorf("dkim_setup 失败: %w", err)
 	}
@@ -1053,6 +1074,9 @@ chmod +x /tmp/deploy_config.sh
 	if _, err := ssh.RunCommand(ctx, sshCfg, cmd); err != nil {
 		return fmt.Errorf("deploy_config 失败: %w", err)
 	}
+	if err := kumoMTASelfCheck(ctx, sshCfg, v); err != nil {
+		return err
+	}
 	_, _ = db.ExecContext(ctx,
 		`UPDATE vps_instances SET dkim_public_key=?, smtp_account=?, smtp_password=? WHERE id=?`,
 		dkimPub, v.Username, v.Password, vpsID)
@@ -1076,6 +1100,51 @@ chmod +x /tmp/deploy_config.sh
 }
 
 // deployMailcowOnVPS 部署 mailcow dockerized（收发一体，IMAP/SMTP）
+func detectRemoteInternalIP(ctx context.Context, sshCfg ssh.Config) (string, error) {
+	out, err := ssh.RunCommand(ctx, sshCfg, `ip -o -4 addr show scope global | awk '{split($4,a,"/"); print a[1]; exit}'`)
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(out)
+	if ip == "" {
+		return "", fmt.Errorf("remote internal IP is empty")
+	}
+	return ip, nil
+}
+
+func kumoMTASelfCheck(ctx context.Context, sshCfg ssh.Config, v DeployVars) error {
+	keyPath := "/opt/kumomta/etc/keys/" + v.RootDomain + "/" + v.Selector + ".key"
+	keyDir := "/opt/kumomta/etc/keys/" + v.RootDomain
+	cmd := fmt.Sprintf(`set +e
+fail=0
+echo "===== KumoMTA self-check ====="
+systemctl is-active --quiet kumomta || { echo "FAIL: kumomta is not active"; fail=1; }
+ss -tlnp 2>/dev/null | grep -E ':(587)\b' >/dev/null || { echo "FAIL: 587 is not listening"; fail=1; }
+grep -F %s /opt/kumomta/etc/policy/init.lua >/dev/null || { echo "FAIL: init.lua source_address is not the VM internal IP %s"; fail=1; }
+test -r %s || { echo "FAIL: DKIM private key is not readable: %s"; fail=1; }
+echo "--- DKIM key dir 详情 (%s) ---"
+ls -la %s 2>&1 || echo "(目录不存在)"
+echo "--- 以 kumod 身份测试可读性 ---"
+sudo -u kumod test -r %s 2>&1 && echo "kumod-readable: yes" || echo "kumod-readable: NO"
+id kumod 2>&1 || echo "kumod 用户不存在"
+echo "--- ip addr ---"
+ip -o -4 addr show scope global || true
+echo "--- ports ---"
+ss -tlnp 2>/dev/null | grep -E ':(25|465|587)\b' || true
+echo "--- journal tail ---"
+journalctl -u kumomta -n 120 --no-pager 2>&1 || true
+exit $fail
+`, shellQuote("source_address = '"+v.BindIP+"'"), v.BindIP, shellQuote(keyPath), keyPath, keyDir, shellQuote(keyDir), shellQuote(keyPath))
+	if out, err := ssh.RunCommand(ctx, sshCfg, cmd); err != nil {
+		return fmt.Errorf("KumoMTA self-check 失败: %w\n%s", err, out)
+	}
+	return nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
