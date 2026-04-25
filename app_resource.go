@@ -215,9 +215,8 @@ func (a *App) FixMailNodeTag(vpsIDs []string) (int, error) {
 			logger.Warn("SetTags %s 失败: %v", name, err)
 			continue
 		}
-		// 确保 project 里有 firewall 规则（幂等）；按用户配置应用白名单（空则维持全开）
-		allowlist, _ := loadAllowlist(db, credID)
-		_ = cli.EnsureMailNodeFirewall(ctx, allowlist)
+		// 确保 project 里有 firewall 规则（幂等）
+		_ = cli.EnsureMailNodeFirewall(ctx)
 		done++
 		logger.Info("✅ VM %s 已补 %s tag", name, gcp.MailNodeTag)
 	}

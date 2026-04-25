@@ -443,8 +443,7 @@ func StartStageB(ctx context.Context, batchID string, req StageBRequest, onLog L
 			}
 			gcpClients[credID] = cli
 			if !firewallReady[credID] {
-				allowlist := loadFirewallAllowlist(credID)
-				if err := cli.EnsureMailNodeFirewall(runCtx, allowlist); err != nil {
+				if err := cli.EnsureMailNodeFirewall(runCtx); err != nil {
 					onLog(batchID, 0, "WARN", fmt.Sprintf("确保防火墙规则失败 cred=%s: %v", credID, err))
 				} else {
 					firewallReady[credID] = true

@@ -441,7 +441,7 @@ func runSlot(
 		diskType = "pd-balanced"
 	}
 
-	if err := gcpClient.EnsureMailNodeFirewall(ctx, loadFirewallAllowlist(gcpCredID)); err != nil {
+	if err := gcpClient.EnsureMailNodeFirewall(ctx); err != nil {
 		log("WARN", "确保防火墙规则失败: %v", err)
 	}
 
@@ -704,31 +704,6 @@ func loadGCPClient(ctx context.Context, credID string) (*gcp.Client, error) {
 		Blob:      blob,
 	}
 	return gcp.NewClient(ctx, cred)
-}
-
-// loadFirewallAllowlist 读取指定 GCP 凭证的防火墙白名单 CIDR 列表。
-// 表里没有记录或为空数组时返回 nil（即维持全开）。
-func loadFirewallAllowlist(credID string) []string {
-	db := store.DB()
-	if db == nil {
-		return nil
-	}
-	var raw string
-	row := db.QueryRow(`SELECT allowed_ips FROM gcp_firewall_allowlist WHERE cred_id=?`, credID)
-	if err := row.Scan(&raw); err != nil {
-		return nil
-	}
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var ips []string
-	if err := json.Unmarshal([]byte(raw), &ips); err != nil {
-		return nil
-	}
-	if len(ips) == 0 {
-		return nil
-	}
-	return ips
 }
 
 // loadAliyunDns 按 credID 加载阿里云凭证并返回 AliyunDns

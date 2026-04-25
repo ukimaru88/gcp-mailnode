@@ -153,15 +153,6 @@ CREATE TABLE IF NOT EXISTS personas (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- v0.1.44：每个 GCP 凭证对应一份防火墙白名单（CIDR JSON 数组）。
--- 空 / 不存在 = 维持 v2 全开行为；非空 = 收紧 mailnode-mail-ports-v2 的 SourceRanges 到白名单 + IAP 段。
-CREATE TABLE IF NOT EXISTS gcp_firewall_allowlist (
-    cred_id     TEXT PRIMARY KEY,
-    allowed_ips TEXT NOT NULL DEFAULT '[]',
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (cred_id) REFERENCES gcp_credentials(id) ON DELETE CASCADE
-);
-
 CREATE INDEX IF NOT EXISTS idx_vps_status ON vps_instances(status, deploy_status);
 CREATE INDEX IF NOT EXISTS idx_static_status ON static_ips(status);
 CREATE INDEX IF NOT EXISTS idx_dns_domain ON dns_records(domain);
