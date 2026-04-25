@@ -10,6 +10,8 @@ import {
   ListPersonas,
   // @ts-ignore
   FixMailNodeTag,
+  // @ts-ignore
+  CleanupOrphanResources,
 } from '../../wailsjs/go/main/App'
 import { main } from '../../wailsjs/go/models'
 import { useToast } from '../components/Toast'
@@ -88,6 +90,23 @@ export default function Resources() {
     } catch (e: any) { toast('error', '删除失败: ' + (e?.message || e)) }
   }
 
+  const cleanupOrphans = async () => {
+    if (!await confirmDlg({
+      message: '清理本地孤立记录？\n\n仅清除"对应 GCP 凭证已被删除"的本地数据库记录，不调用任何云端 API。如果云端 VPS / 静态 IP / DNS 记录还在，需要你自行去 GCP / 阿里云控制台删除。',
+      danger: false,
+    })) return
+    try {
+      const r = await CleanupOrphanResources() as { vps_deleted: number; static_ips_deleted: number; dns_records_deleted: number }
+      const total = r.vps_deleted + r.static_ips_deleted + r.dns_records_deleted
+      if (total === 0) {
+        toast('success', '没有孤立记录需要清理')
+      } else {
+        toast('success', `已清理 VPS=${r.vps_deleted}, 静态 IP=${r.static_ips_deleted}, DNS=${r.dns_records_deleted}`)
+      }
+      await refresh()
+    } catch (e: any) { toast('error', '清理失败: ' + (e?.message || e)) }
+  }
+
   const batchPTR = async () => {
     if (selected.size === 0) { toast('warning', '请先勾选 VPS'); return }
     try {
@@ -149,6 +168,11 @@ export default function Resources() {
           </label>
           <button onClick={refresh} className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
             <RefreshCw size={14} /> 刷新
+          </button>
+          <button onClick={cleanupOrphans}
+                  title="清理本地数据库中对应 GCP 凭证已被删除的孤立记录（不调用云端 API）"
+                  className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
+            🧹 清理孤立记录
           </button>
           {tab === 'vps' && (
             <>

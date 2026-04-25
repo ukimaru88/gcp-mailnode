@@ -561,3 +561,57 @@ func loadAliyunForApp(credID string) (*dns.AliyunDns, error) {
 	}
 	return dns.NewAliyunDns(ak, string(sk)), nil
 }
+
+// OrphanCleanupReport 描述孤立资源清理结果。
+type OrphanCleanupReport struct {
+	VPSDeleted        int `json:"vps_deleted"`         // 孤立 VPS 记录被删除的条数
+	StaticIPsDeleted  int `json:"static_ips_deleted"`  // 孤立静态 IP 记录被删除的条数
+	DNSRecordsDeleted int `json:"dns_records_deleted"` // 孤立 DNS 记录被删除的条数
+}
+
+// CleanupOrphanResources 清理本地数据库中"对应 GCP 凭证已被删除"的孤立资源记录。
+//
+// 仅清理本地 SQLite 表，不会调用任何云端 API（你需要自行确保 GCP 上对应资源已被释放）。
+// 适用场景：删除 GCP 凭证后，旧的 VPS / 静态 IP / DNS 记录在资源页继续显示但无法操作。
+func (a *App) CleanupOrphanResources() (OrphanCleanupReport, error) {
+	var report OrphanCleanupReport
+	db, err := requireDB()
+	if err != nil {
+		return report, err
+	}
+
+	// 1. 孤立 VPS：gcp_cred_id 不在 gcp_credentials 表里
+	res, err := db.Exec(`DELETE FROM vps_instances
+		WHERE gcp_cred_id NOT IN (SELECT id FROM gcp_credentials)`)
+	if err != nil {
+		return report, fmt.Errorf("清理孤立 VPS 失败: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		report.VPSDeleted = int(n)
+	}
+
+	// 2. 孤立静态 IP
+	res, err = db.Exec(`DELETE FROM static_ips
+		WHERE gcp_cred_id NOT IN (SELECT id FROM gcp_credentials)`)
+	if err != nil {
+		return report, fmt.Errorf("清理孤立静态 IP 失败: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		report.StaticIPsDeleted = int(n)
+	}
+
+	// 3. 孤立 DNS 记录：related_instance_id 非空但 VPS 已不存在
+	res, err = db.Exec(`DELETE FROM dns_records
+		WHERE related_instance_id != ''
+		  AND related_instance_id NOT IN (SELECT id FROM vps_instances)`)
+	if err != nil {
+		return report, fmt.Errorf("清理孤立 DNS 记录失败: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		report.DNSRecordsDeleted = int(n)
+	}
+
+	logger.Info("孤立资源清理完成: VPS=%d, IPs=%d, DNS=%d",
+		report.VPSDeleted, report.StaticIPsDeleted, report.DNSRecordsDeleted)
+	return report, nil
+}
