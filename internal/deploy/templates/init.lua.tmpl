@@ -1,0 +1,124 @@
+-- KumoMTA init.lua - gcp-mailnode 生成
+-- FQDN={FQDN} DOMAIN={DOMAIN} SELECTOR={SELECTOR} EGRESS_SOURCE_IP={BIND_IP}
+--
+-- 若启动失败请核对 API（不同版本字段可能差异）：
+--   * tls_mode vs tls（465 SMTPS）
+--   * relay_hosts vs relay_hosts_allowed
+--   * smtp_server_auth_plain 事件名在个别版本为 smtp_server_authentication
+--   * get_queue_config 回调签名
+
+local kumo = require 'kumo'
+
+kumo.on('init', function()
+  kumo.configure_local_logs {
+    log_dir = '/var/log/kumomta',
+  }
+
+  kumo.define_spool { name = 'data', path = '/var/spool/kumomta/data' }
+  kumo.define_spool { name = 'meta', path = '/var/spool/kumomta/meta' }
+
+  -- 接收端口（本机中继）：显式 0.0.0.0 绑所有接口，避免只绑 loopback
+  kumo.start_esmtp_listener {
+    listen = '0.0.0.0:25',
+    hostname = '{FQDN}',
+    relay_hosts = { '127.0.0.1', '::1' },
+    max_recipients_per_message = 100,
+    trace_headers = {
+      received_header = {TRACE_RECEIVED},
+      supplemental_header = {TRACE_SUPPLEMENTAL},
+    },
+  }
+
+  -- Submission 587（STARTTLS + AUTH 必需）
+  -- 不写 relay_hosts：空 `{}` 在 Lua→JSON 序列化时会被解析成 map（report: "expected a sequence"），
+  -- 直接省略让 KumoMTA 走"AUTH 通过才允许中继"的默认逻辑。
+  kumo.start_esmtp_listener {
+    listen = '0.0.0.0:587',
+    hostname = '{FQDN}',
+    tls_certificate = '/opt/kumomta/etc/tls/cert.pem',
+    tls_private_key = '/opt/kumomta/etc/tls/key.pem',
+    trace_headers = {
+      received_header = {TRACE_RECEIVED},
+      supplemental_header = {TRACE_SUPPLEMENTAL},
+    },
+  }
+
+  -- 注：KumoMTA 2026.03+ 的 start_esmtp_listener 移除了 tls_mode='Implicit' 字段，
+  -- 原生不支持 465 implicit TLS。客户端（brutal-mailer / 邮件大师）请用 587 + STARTTLS。
+  -- 如坚持要 465，可在前面加 haproxy/nginx stream SNI terminator，此处不做。
+end)
+
+-- KumoMTA 2026.03+ 的 egress source/pool 改用事件回调模式（define_* 函数已废弃）
+kumo.on('get_egress_source', function(source_name)
+  return kumo.make_egress_source {
+    name = source_name,
+    -- GCP VM 网卡本机只有内网 IP；外网静态 IP 是 NAT 映射，不能作为本机 bind 地址。
+    source_address = '{BIND_IP}',
+    ehlo_domain = '{FQDN}',
+  }
+end)
+
+kumo.on('get_egress_pool', function(pool_name)
+  return kumo.make_egress_pool {
+    name = pool_name,
+    entries = { { name = 'primary' } },
+  }
+end)
+
+-- KumoMTA 2026.03+ requires an egress path config callback; without it,
+-- messages can remain scheduled without delivery attempts.
+kumo.on('get_egress_path_config', function(routing_domain, egress_source, site_name)
+  return kumo.make_egress_path {
+    enable_tls = 'OpportunisticInsecure',
+    connection_limit = 10,
+    max_deliveries_per_connection = 100,
+    idle_timeout = '60s',
+  }
+end)
+
+local auth = require 'smtp_auth'
+kumo.on('smtp_server_auth_plain', auth.check)
+
+-- AUTH 通过的会话允许 relay 到任何外部域（Submission 出站发信核心）
+-- get_listener_domain 决定 RCPT TO 阶段是否接受投递：返回 {relay_to=true} 即放行。
+-- 判断会话已 AUTH 的正确 API：conn_meta:get_meta("authn_id") 返回 string 或 nil。
+kumo.on('get_listener_domain', function(domain, listener, conn_meta)
+  local authn = conn_meta:get_meta('authn_id')
+  if authn and authn ~= '' then
+    return kumo.make_listener_domain { relay_to = true }
+  end
+  return kumo.make_listener_domain { relay_to = false }
+end)
+
+kumo.on('smtp_server_message_received', function(msg)
+  -- KumoMTA 作为透明中继：Persona 伪造（Received 链 / UA / X-Mailer）完全在
+  -- brutal-mailer 侧完成，这里只负责"屏蔽客户端真实 IP"兜底。
+  --
+  -- 若 HideClientIP 启用，KumoMTA 自己加在 Received 里的客户端 IP 也会被删掉，
+  -- brutal 生成的 Received 链作为唯一 Received 头暴露给接收方。
+  -- KumoMTA 2026.03+ 使用 msg:remove_all_named_headers（旧 remove_header 已废弃）。
+  -- DKIM 签名：只对结构性头签名。User-Agent/X-Mailer 不签名，
+  -- 因为 brutal-mailer 每封信可能使用不同 persona，签名也没有验证价值。
+  -- KumoMTA 2026.03+ 使用 rsa_sha256_signer 两步模式（旧 msg:dkim_sign{...} 已废弃）。
+  local signer = kumo.dkim.rsa_sha256_signer {
+    domain = '{DOMAIN}',
+    selector = '{SELECTOR}',
+    headers = { 'From', 'To', 'Subject', 'Date', 'Message-ID' },
+    key = '/opt/kumomta/etc/keys/{DOMAIN}/{SELECTOR}.key',
+  }
+  msg:dkim_sign(signer)
+
+  -- ARC seal: 复用同一把 RSA 密钥（DKIM 与 ARC 共用 key 是允许的）。
+  -- authentication_results 传空表 {} —— KumoMTA 是发件 MTA、不是 inbound
+  -- 验证站，ARC chain 从我们这里开始（i=1），上游无验证记录可继承。
+  -- server_id 用 FQDN，会出现在 ARC-Authentication-Results 头里作为
+  -- authserv-id。必须在 dkim_sign 之后调用，因为 ARC 要 seal 包含 DKIM
+  -- 头在内的最终消息状态。
+  msg:arc_seal(signer, '{FQDN}', {})
+end)
+
+kumo.on('get_queue_config', function(domain, tenant, campaign)
+  return kumo.make_queue_config {
+    egress_pool = 'default',
+  }
+end)
