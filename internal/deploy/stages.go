@@ -1540,8 +1540,20 @@ func kumoMTASelfCheck(ctx context.Context, sshCfg ssh.Config, v DeployVars) erro
 	cmd := fmt.Sprintf(`set +e
 fail=0
 echo "===== KumoMTA self-check ====="
-systemctl is-active --quiet kumomta || { echo "FAIL: kumomta is not active"; fail=1; }
-ss -tlnp 2>/dev/null | grep -E ':(587)\b' >/dev/null || { echo "FAIL: 587 is not listening"; fail=1; }
+# v0.2.1：KumoMTA 在 e2-small (2 核) 上启动慢，加 30 秒重试避免 race。
+# 每秒探一次 systemctl active + 587 监听，30 秒都没起来才判 FAIL。
+ok=0
+for i in $(seq 1 30); do
+  if systemctl is-active --quiet kumomta && ss -tlnp 2>/dev/null | grep -E ':(587)\b' >/dev/null; then
+    ok=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ok" != "1" ]; then
+  systemctl is-active --quiet kumomta || { echo "FAIL: kumomta is not active"; fail=1; }
+  ss -tlnp 2>/dev/null | grep -E ':(587)\b' >/dev/null || { echo "FAIL: 587 is not listening"; fail=1; }
+fi
 grep -F %s /opt/kumomta/etc/policy/init.lua >/dev/null || { echo "FAIL: init.lua source_address is not the VM internal IP %s"; fail=1; }
 test -r %s || { echo "FAIL: DKIM private key is not readable: %s"; fail=1; }
 echo "--- DKIM key dir 详情 (%s) ---"
