@@ -11,11 +11,15 @@ import Export from './pages/Export'
 import LiveLog from './pages/LiveLog'
 import Personas from './pages/Personas'
 import Extract from './pages/Extract'
+import GCPMonitor from './pages/GCPMonitor'
+import ServerStatus from './pages/ServerStatus'
 
 // keepAlive：所有页面一次性挂载，通过 display 切换可见性，tab 切换时组件不卸载，state 不丢。
 const PAGES: { path: string; el: JSX.Element }[] = [
   { path: '/batch',       el: <Batch /> },
   { path: '/resources',   el: <Resources /> },
+  { path: '/server-status', el: <ServerStatus /> },
+  { path: '/gcp-monitor', el: <GCPMonitor /> },
   { path: '/export',      el: <Export /> },
   { path: '/credentials', el: <Credentials /> },
   { path: '/templates',   el: <Templates /> },

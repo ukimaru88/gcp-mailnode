@@ -11,12 +11,16 @@ import {
   Cloud,
   UserCircle2,
   Inbox,
+  BarChart3,
+  Cable,
 } from 'lucide-react'
 import { GetVersion } from '../../wailsjs/go/main/App'
 
 const navItems = [
   { to: '/batch',       icon: Rocket,      label: '批量开机' },
   { to: '/resources',   icon: Server,      label: '资源清单' },
+  { to: '/server-status', icon: Cable,      label: '连接服务器' },
+  { to: '/gcp-monitor', icon: BarChart3,   label: 'GCP 监控' },
   { to: '/export',      icon: Download,    label: 'SMTP 导出' },
   { to: '/extract',     icon: Inbox,       label: '邮箱提取' },
   { to: '/credentials', icon: KeyRound,    label: '凭证管理' },
