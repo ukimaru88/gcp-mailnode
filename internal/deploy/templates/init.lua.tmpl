@@ -56,65 +56,9 @@ end)
 -- v0.1.57 占位符：单 NIC 时是标准 source/pool；多 NIC 时是 8 source 随机轮换块
 {SOURCES_BLOCK}
 
--- v0.1.84：按 routing_domain 区分 shaping（日本三大手机运营商专项调优 + 其他通用）。
---
--- 日本三大手机邮箱硬限制（来自官方文档 + Validity/Warmy 行业共识）：
---   docomo.ne.jp：3 并发/MX，每连接 ≤100 封；超量直接 421 + 24h IP 黑名单
---   ezweb.ne.jp / au.com：拥塞直接 TCP RESET（不返 421），邮件 ≤3MB
---   softbank.ne.jp / i.softbank.jp：i.softbank.jp 邮件 ≤1MB；无公开速率，按 docomo 类似处理
--- 三家合计理论上限 ~150 封/分钟/服务器。1000 封/分钟/服务器目标必须靠 Gmail/Yahoo.co.jp 等承担余下 850。
---
--- 一旦触发 docomo 限制，整个发件 IP 进 24h 黑名单（按 IP 段封不按账号），多 IP 轮换是硬刚需。
-kumo.on('get_egress_path_config', function(routing_domain, egress_source, site_name)
-  -- docomo：最严，3 并发，每分钟 ≤30 封（每连接 100 × 3 conn / 10 倍降速起步）
-  if routing_domain == 'docomo.ne.jp' then
-    return kumo.make_egress_path {
-      enable_tls = 'Opportunistic',
-      connection_limit = 3,
-      max_deliveries_per_connection = 50,
-      max_message_rate = '30/m',
-      max_connection_rate = '5/m',
-      idle_timeout = '30s',
-      max_ready = 50000,
-    }
-  end
-
-  -- au / ezweb：拥塞 TCP RESET，并发稍宽
-  if routing_domain == 'ezweb.ne.jp' or routing_domain == 'au.com' then
-    return kumo.make_egress_path {
-      enable_tls = 'Opportunistic',
-      connection_limit = 5,
-      max_deliveries_per_connection = 50,
-      max_message_rate = '60/m',
-      idle_timeout = '30s',
-      max_ready = 50000,
-    }
-  end
-
-  -- softbank 系（含 i.softbank.jp / vodafone.ne.jp / ymobile.ne.jp）
-  if routing_domain == 'softbank.ne.jp' or routing_domain == 'i.softbank.jp'
-     or routing_domain == 'vodafone.ne.jp' or routing_domain == 'ymobile.ne.jp' then
-    return kumo.make_egress_path {
-      enable_tls = 'Opportunistic',
-      connection_limit = 5,
-      max_deliveries_per_connection = 100,
-      max_message_rate = '60/m',
-      idle_timeout = '30s',
-      max_ready = 50000,
-    }
-  end
-
-  -- 其他域名（Gmail / Yahoo.co.jp / iCloud / 自由域名）：高吞吐通用配置
-  -- 单 IP 10 并发是 Gmail 反垃圾的安全上限；max_message_rate 不限（让 Gmail 自己 throttle）
-  return kumo.make_egress_path {
-    enable_tls = 'OpportunisticInsecure',
-    connection_limit = 10,
-    max_deliveries_per_connection = 1000,
-    idle_timeout = '60s',
-    max_ready = 50000,
-    max_message_rate = '20/s',  -- 20 封/秒 ≈ 1200/分钟，覆盖 1000/min 目标
-  }
-end)
+-- v0.1.85：取消所有 egress path shaping。不注册 get_egress_path_config，
+-- 让 KumoMTA 走内部默认（connection_limit 默认 10，无显式速率上限，
+-- 遇 421/throttle 由 KumoMTA 自适应退避）。
 
 local auth = require 'smtp_auth'
 kumo.on('smtp_server_auth_plain', auth.check)
