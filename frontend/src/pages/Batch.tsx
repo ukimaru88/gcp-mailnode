@@ -34,22 +34,7 @@ declare global {
   }
 }
 
-// v0.1.9：固定锁定日本东京 + 大阪。Stage A 后端也硬码。
-// 默认日本 2 region；用户可勾选扩展到亚洲其他区（注意：IP 会是对应区的，不再是纯日本品牌）
-const ASIA_REGIONS = [
-  { code: 'asia-northeast1', label: '日本东京', defaultOn: true },
-  { code: 'asia-northeast2', label: '日本大阪', defaultOn: true },
-  { code: 'asia-northeast3', label: '韩国首尔', defaultOn: false },
-  { code: 'asia-east1',      label: '台湾彰化', defaultOn: false },
-  { code: 'asia-east2',      label: '香港',     defaultOn: false },
-  { code: 'asia-southeast1', label: '新加坡',   defaultOn: false },
-  { code: 'asia-southeast2', label: '雅加达',   defaultOn: false },
-]
-
-// IP 前缀过滤选项
-// - blacklist: 排除 IPPrefixExclude 里开头的，其余全保留（默认——GCP 日本区 34.x 声誉较差）
-// - all: 不过滤，仅靠 DNSBL
-type IPPrefixMode = 'blacklist' | 'all'
+// v0.1.57：region 锁定 asia-northeast1（东京）；前端不再让用户勾选 region/GCP 账号/IP 前缀。
 
 interface LogLine {
   slot?: number
@@ -81,6 +66,7 @@ const statusBadge = (s: string) => {
     clean: 'bg-green-500/20 text-green-300',
     dirty: 'bg-red-500/20 text-red-300',
     set: 'bg-green-500/20 text-green-300',
+    partial: 'bg-orange-500/20 text-orange-300',
     deployed: 'bg-green-500/20 text-green-300',
     deploying: 'bg-indigo-500/20 text-indigo-300',
   }
@@ -146,11 +132,12 @@ export default function Batch() {
   const [logsC, setLogsC] = useState<LogLine[]>([])
   const [logsD, setLogsD] = useState<LogLine[]>([])
 
-  // Step 1 表单
-  const [selectedGCP, setSelectedGCP] = useState<string[]>([])
+  // Step 1 表单（v0.1.57 简化：region 锁东京、GCP 账号自动取首个、IP 前缀过滤删除；输入是「服务器数」）
   const [tplA, setTplA] = useState('')
-  const [count, setCount] = useState(1)
+  const [vpsCount, setVpsCount] = useState(1)
   const [dnsblTh, setDnsblTh] = useState(1)
+  // v0.1.72：IP 前缀黑名单恢复 UI 配置；默认排除 34.（GCP 日本区 95% 是 34.x，声誉差）
+  const [ipPrefixExclude, setIpPrefixExclude] = useState<string>('34.')
   // 0 = 无限循环直到达到目标或所有 region 配额耗尽；>0 = 总尝试上限 = N * 此值
   const [maxRetry, setMaxRetry] = useState(0)
   const [batchProgress, setBatchProgress] = useState<{ total: number; succeeded: number; failed: number; status: string } | null>(null)
@@ -158,11 +145,6 @@ export default function Batch() {
   const [progressStartAt, setProgressStartAt] = useState<number>(0)
   // 当前正在执行的 task ID：Stage A 用 batchID；Stage C/D 返回独立 taskID
   const [currentTaskID, setCurrentTaskID] = useState<string>('')
-  const [ipPrefixMode, setIpPrefixMode] = useState<IPPrefixMode>('blacklist')
-  const [excludePrefixText, setExcludePrefixText] = useState('34.')
-  const [selectedRegions, setSelectedRegions] = useState<string[]>(
-    ASIA_REGIONS.filter(r => r.defaultOn).map(r => r.code)
-  )
   // Step 1 → 2 过渡：用户勾选要保留的 clean IP，其余自动释放
   const [selectedCleanIPs, setSelectedCleanIPs] = useState<Set<string>>(new Set())
   const [pruning, setPruning] = useState(false)
@@ -277,13 +259,17 @@ export default function Batch() {
     }
   }
 
-  const toggleGCP = (id: string) => {
-    setSelectedGCP(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
-  }
+  // v0.1.57：多 NIC 时按 slot_group 整组切换；单 NIC 时 slot_group=ip.id（一组一 IP）行为退化
   const toggleCleanIP = (id: string) => {
+    const target = cleanIPs.find(x => x.id === id)
+    if (!target) return
+    const sg = (target as any).slot_group || target.id
+    const groupIDs = cleanIPs.filter(x => (((x as any).slot_group) || x.id) === sg).map(x => x.id)
     setSelectedCleanIPs(prev => {
       const n = new Set(prev)
-      n.has(id) ? n.delete(id) : n.add(id)
+      const allOn = groupIDs.every(g => n.has(g))
+      if (allOn) groupIDs.forEach(g => n.delete(g))
+      else groupIDs.forEach(g => n.add(g))
       return n
     })
   }
@@ -313,33 +299,32 @@ export default function Batch() {
     }
   }
 
+  // v0.1.57：从所选模板读 nic_count；多 NIC 模板（如 8）触发 1 台 VPS = nic_count 个 IP 的逻辑
+  const tplNICCount = (() => {
+    const t = tpls.find(x => x.id === tplA)
+    const n = (t as any)?.nic_count
+    return n && n > 0 ? n : 1
+  })()
+  const totalIPCount = vpsCount * tplNICCount
+
   // === Step 1 操作 ===
+  // v0.1.57：region 锁东京、GCP 账号取首个、IP 前缀过滤删除；输入是「服务器数量」自动 ×NIC 算 IP
   const startStageA = async () => {
-    if (selectedGCP.length === 0) { toast('warning', '请选择至少一个 GCP 账号'); return }
+    if (gcps.length === 0) { toast('warning', '请先到「凭证」页添加 GCP 账号'); return }
     if (!tplA) { toast('warning', '请选择开机模板'); return }
-    if (count < 1) { toast('warning', '机器数量需 >= 1'); return }
-    if (selectedRegions.length === 0) { toast('warning', '请至少选择一个 region'); return }
+    if (vpsCount < 1) { toast('warning', '服务器数量需 >= 1'); return }
 
-    // 把前端模式映射成后端两个列表
-    const ipPrefixFilter: string[] = []
-    let ipPrefixExclude: string[] = []
-    if (ipPrefixMode === 'blacklist') {
-      ipPrefixExclude = excludePrefixText
-        .split(/[\s,，、]+/)
-        .map(s => s.trim())
-        .filter(s => s.length > 0)
-        .map(s => s.endsWith('.') ? s : s + '.')
-    }
-
+    const totalIPs = vpsCount * tplNICCount
     const req = {
-      gcp_cred_ids: selectedGCP,
+      gcp_cred_ids: [gcps[0].id],
       template_id: tplA,
-      count,
-      regions: selectedRegions,
+      count: totalIPs,
+      regions: ['asia-northeast1'],
       dnsbl_threshold: dnsblTh,
       max_retry_per_slot: maxRetry,
-      ip_prefix_filter: ipPrefixFilter,
-      ip_prefix_exclude: ipPrefixExclude,
+      ip_prefix_filter: [],
+      ip_prefix_exclude: ipPrefixExclude.split('\n').map(s => s.trim()).filter(s => s.length > 0),
+      nic_count: tplNICCount,
     } as any
 
     try {
@@ -347,12 +332,12 @@ export default function Batch() {
       setCleanIPs([])
       setAllBatchIPs([])
       setSelectedCleanIPs(new Set())
-      setBatchProgress({ total: count, succeeded: 0, failed: 0, status: 'stage-a-running' })
+      setBatchProgress({ total: totalIPs, succeeded: 0, failed: 0, status: 'stage-a-running' })
       setProgressStartAt(Date.now())
       const id = await StartStageA(req)
       setBatchID(id)
-      setCurrentTaskID(id) // Stage A 用 batchID 作为 taskID
-      toast('success', '阶段 A 已启动: ' + id.slice(0, 8))
+      setCurrentTaskID(id)
+      toast('success', `阶段 A 已启动（${vpsCount} 台 × ${tplNICCount} NIC = ${totalIPs} IP）: ` + id.slice(0, 8))
     } catch (e: any) {
       toast('error', '启动失败: ' + (e?.message || e))
     }
@@ -575,23 +560,10 @@ export default function Batch() {
             <div className="bg-[#1a1d27] rounded-lg border border-slate-700/50 p-4 space-y-4">
               <h2 className="font-semibold text-slate-100">Step 1 · 预留 IP（仅开机 + DNSBL 检测）</h2>
 
-              <div>
-                <label className="block text-xs text-slate-400 mb-1.5">GCP 账号（多选）</label>
-                <div className="flex flex-wrap gap-2">
-                  {gcps.length === 0 && <span className="text-xs text-slate-500">无可用 GCP 凭证（需启用）</span>}
-                  {gcps.map(c => {
-                    const on = selectedGCP.includes(c.id)
-                    return (
-                      <button key={c.id} type="button" onClick={() => toggleGCP(c.id)}
-                              className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
-                                on ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
-                                : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
-                              }`}>
-                        {c.name}
-                      </button>
-                    )
-                  })}
-                </div>
+              <div className="text-xs text-slate-400 bg-slate-900/40 border border-slate-700/40 rounded-md px-3 py-2 leading-relaxed">
+                <div>使用账号：<span className="text-indigo-300">{gcps[0]?.name || '（无可用 GCP 凭证）'}</span></div>
+                <div>区域：<span className="text-indigo-300">日本东京 asia-northeast1</span>（已锁定）</div>
+                <div>IP 前缀：<span className="text-indigo-300">不过滤</span>（仅 DNSBL）</div>
               </div>
 
               <div>
@@ -599,17 +571,20 @@ export default function Batch() {
                 <select className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
                         value={tplA} onChange={e => setTplA(e.target.value)}>
                   <option value="">请选择...</option>
-                  {tpls.map(t => <option key={t.id} value={t.id}>{t.name}{t.is_preset ? ' [预设]' : ''}</option>)}
+                  {tpls.map(t => <option key={t.id} value={t.id}>{t.name}{t.is_preset ? ' [预设]' : ''}{(t as any).nic_count > 1 ? ` · ${(t as any).nic_count} NIC` : ''}</option>)}
                 </select>
               </div>
 
               <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="block text-xs text-slate-400 mb-1">目标干净 IP 数量</label>
-                  <input type="number" min={1} max={200}
+                  <label className="block text-xs text-slate-400 mb-1">服务器数量</label>
+                  <input type="number" min={1} max={50}
                          className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
-                         value={count} onChange={e => setCount(Math.max(1, Math.min(200, Number(e.target.value) || 1)))} />
-                  <p className="text-[10px] text-slate-500 mt-0.5">筛到这个数量就停。下一步你再挑要开机的 IP。</p>
+                         value={vpsCount} onChange={e => setVpsCount(Math.max(1, Math.min(50, Number(e.target.value) || 1)))} />
+                  <p className="text-[10px] text-slate-500 mt-0.5">将预留 <span className="text-indigo-400 font-semibold">{vpsCount} × {tplNICCount} = {totalIPCount}</span> 个清洁 IP</p>
+                  {totalIPCount > 24 && (
+                    <p className="text-[10px] text-amber-400 mt-0.5">⚠ 超 24 IP/CPU 配额，GCP Console → IAM & Admin → Quotas 提"In-use IP addresses"和"CPUs"到 ≥ {totalIPCount}</p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs text-slate-400 mb-1">DNSBL 阈值（命中几个 RBL 判脏）</label>
@@ -628,57 +603,14 @@ export default function Batch() {
               </div>
 
               <div>
-                <label className="block text-xs text-slate-400 mb-1.5">抓取 region（多选，每个 region 默认配额 8 个 IP）</label>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {ASIA_REGIONS.map(r => {
-                    const on = selectedRegions.includes(r.code)
-                    return (
-                      <label key={r.code} className={`inline-flex items-center gap-1.5 px-2 py-1 rounded border text-xs cursor-pointer select-none ${on ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-200' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-500'}`}>
-                        <input type="checkbox" className="accent-indigo-500"
-                               checked={on}
-                               onChange={() => {
-                                 setSelectedRegions(prev => on ? prev.filter(x => x !== r.code) : [...prev, r.code])
-                               }} />
-                        <span className="font-mono text-[10px]">{r.code}</span>
-                        <span>{r.label}</span>
-                      </label>
-                    )
-                  })}
-                </div>
-                <p className="text-[10px] text-slate-500 mt-1">
-                  默认只勾日本 2 个。扩到韩国/台湾/香港/新加坡会**混淆 IP 地理品牌**（收件端看到不再是纯日本邮件基础设施），仅在配额不够且你不在意 IP 国籍时开启。
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-400 mb-1.5">IP 前缀过滤</label>
-                <div className="space-y-1.5">
-                  {([
-                    { v: 'blacklist', t: '排除指定前缀（默认排 34.）', hint: '命中黑名单就释放重申，直到筛够目标数量' },
-                    { v: 'all', t: '所有前缀，仅靠 DNSBL', hint: '不看前缀，DNSBL 干净就留' },
-                  ] as { v: IPPrefixMode; t: string; hint: string }[]).map(o => (
-                    <label key={o.v} className="flex items-start gap-2 px-2 py-1.5 bg-slate-900 border border-slate-700 rounded-md text-sm cursor-pointer hover:border-indigo-500">
-                      <input type="radio" name="ipPrefix" className="accent-indigo-500 mt-0.5"
-                             checked={ipPrefixMode === o.v}
-                             onChange={() => setIpPrefixMode(o.v)} />
-                      <div>
-                        <div className="text-slate-300">{o.t}</div>
-                        <div className="text-[10px] text-slate-500">{o.hint}</div>
-                      </div>
-                    </label>
-                  ))}
-                </div>
-                {ipPrefixMode === 'blacklist' && (
-                  <div className="mt-2">
-                    <label className="block text-xs text-slate-400 mb-1">要排除的前缀（多个用空格/逗号分隔，不带 . 会自动补）</label>
-                    <input type="text"
-                           className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm font-mono focus:border-indigo-500 outline-none"
-                           value={excludePrefixText}
-                           onChange={e => setExcludePrefixText(e.target.value)}
-                           placeholder="34. 35." />
-                    <p className="text-[10px] text-slate-500 mt-0.5">例如 <span className="font-mono">34.</span> 会排除所有 34.x.x.x 开头的 IP</p>
-                  </div>
-                )}
+                <label className="block text-xs text-slate-400 mb-1">IP 前缀黑名单（每行一个，匹配前缀的 IP 自动跳过）</label>
+                <textarea
+                  className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none font-mono"
+                  rows={3}
+                  placeholder="34.&#10;例如：34. / 35.230. / 35."
+                  value={ipPrefixExclude}
+                  onChange={e => setIpPrefixExclude(e.target.value)} />
+                <p className="text-[10px] text-slate-500 mt-0.5">默认排除 <span className="text-amber-400 font-mono">34.</span>（GCP 日本区 95% 是 34.x，声誉差）。清空则不过滤。</p>
               </div>
 
               <div className="flex items-center justify-between pt-2">
@@ -755,6 +687,7 @@ export default function Batch() {
                            checked={selectedCleanIPs.size === cleanIPs.length && cleanIPs.length > 0}
                            onChange={toggleAllCleanIPs} /></th>
                     <th className="text-left px-2 py-1.5 font-medium">IP</th>
+                    <th className="text-left px-2 py-1.5 font-medium">分组</th>
                     <th className="text-left px-2 py-1.5 font-medium">区域</th>
                     <th className="text-left px-2 py-1.5 font-medium">DNSBL</th>
                     <th className="text-left px-2 py-1.5 font-medium">创建</th>
@@ -762,23 +695,49 @@ export default function Batch() {
                   </tr>
                 </thead>
                 <tbody>
-                  {cleanIPs.length === 0 && <tr><td colSpan={6} className="text-center py-6 text-slate-500">暂无 clean IP，请点击刷新</td></tr>}
-                  {cleanIPs.map(i => (
-                    <tr key={i.id} className={`border-t border-slate-700/40 ${selectedCleanIPs.has(i.id) ? 'bg-indigo-500/5' : ''}`}>
-                      <td className="px-2 py-1.5"><input type="checkbox"
-                             checked={selectedCleanIPs.has(i.id)} onChange={() => toggleCleanIP(i.id)} /></td>
-                      <td className="px-2 py-1.5 text-slate-200 font-mono">{i.ip}</td>
-                      <td className="px-2 py-1.5 text-slate-300">{i.region}</td>
-                      <td className="px-2 py-1.5 text-green-400">{i.dnsbl_result || 'clean'}</td>
-                      <td className="px-2 py-1.5 text-slate-500">{fmtTime(i.created_at)}</td>
-                      <td className="px-2 py-1.5 text-right">
-                        <button onClick={() => copyText(i.ip, `已复制 ${i.ip}`)}
-                                className="text-slate-400 hover:text-indigo-300 inline-flex items-center gap-1">
-                          <Copy size={12} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {cleanIPs.length === 0 && <tr><td colSpan={7} className="text-center py-6 text-slate-500">暂无 clean IP，请点击刷新</td></tr>}
+                  {(() => {
+                    // v0.1.57：按 slot_group 排序展示，让同一组的 IP 紧挨着；多 NIC 时勾选必须整组
+                    const sorted = [...cleanIPs].sort((a, b) => {
+                      const sa = (a as any).slot_group || a.id
+                      const sb = (b as any).slot_group || b.id
+                      if (sa !== sb) return sa < sb ? -1 : 1
+                      const ia = (a as any).nic_index ?? 0
+                      const ib = (b as any).nic_index ?? 0
+                      return ia - ib
+                    })
+                    const groupSize: Record<string, number> = {}
+                    for (const x of sorted) {
+                      const sg = (x as any).slot_group || x.id
+                      groupSize[sg] = (groupSize[sg] || 0) + 1
+                    }
+                    return sorted.map(i => {
+                      const sg = (i as any).slot_group || i.id
+                      const ni = (i as any).nic_index ?? 0
+                      const sz = groupSize[sg] || 1
+                      return (
+                        <tr key={i.id} className={`border-t border-slate-700/40 ${selectedCleanIPs.has(i.id) ? 'bg-indigo-500/5' : ''}`}>
+                          <td className="px-2 py-1.5"><input type="checkbox"
+                                 checked={selectedCleanIPs.has(i.id)} onChange={() => toggleCleanIP(i.id)} /></td>
+                          <td className="px-2 py-1.5 text-slate-200 font-mono">{i.ip}</td>
+                          <td className="px-2 py-1.5 text-slate-400 font-mono text-[10px]">
+                            {sz > 1
+                              ? <span title={sg}>{sg.slice(0, 6)}·#{ni}<span className="text-slate-500"> /{sz}</span></span>
+                              : <span className="text-slate-600">单</span>}
+                          </td>
+                          <td className="px-2 py-1.5 text-slate-300">{i.region}</td>
+                          <td className="px-2 py-1.5 text-green-400">{i.dnsbl_result || 'clean'}</td>
+                          <td className="px-2 py-1.5 text-slate-500">{fmtTime(i.created_at)}</td>
+                          <td className="px-2 py-1.5 text-right">
+                            <button onClick={() => copyText(i.ip, `已复制 ${i.ip}`)}
+                                    className="text-slate-400 hover:text-indigo-300 inline-flex items-center gap-1">
+                              <Copy size={12} />
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })
+                  })()}
                 </tbody>
               </table>
             </div>
@@ -804,13 +763,13 @@ export default function Batch() {
                 <select className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
                         value={tplB} onChange={e => setTplB(e.target.value)}>
                   <option value="">请选择...</option>
-                  {tpls.map(t => <option key={t.id} value={t.id}>{t.name}{t.is_preset ? ' [预设]' : ''}</option>)}
+                  {tpls.map(t => <option key={t.id} value={t.id}>{t.name}{t.is_preset ? ' [预设]' : ''}{(t as any).nic_count > 1 ? ` · ${(t as any).nic_count} NIC` : ''}</option>)}
                 </select>
               </div>
 
               <div className="text-xs text-slate-400 bg-slate-900/50 border border-slate-700/50 rounded-md px-3 py-2 space-y-1">
                 <div>🔑 SSH 登录已改用密钥认证（v0.1.7+）。软件自动生成密钥对并注入到 VPS，不需要设置 root 密码。</div>
-                <div>🔥 首次开机会自动在 GCP 项目里建防火墙规则 <span className="font-mono text-indigo-300">mailnode-mail-ports</span>（入站 22/25/80/443/465/587/2525）+ <span className="font-mono text-indigo-300">mailnode-smtp-out</span>（出站 25/465/587）。VPS 打 <span className="font-mono">mail-node</span> tag 自动命中，已存在则复用。</div>
+                <div>🔥 首次开机会自动在 GCP 项目里建防火墙规则 <span className="font-mono text-indigo-300">mailnode-mail-ports</span>（入站 22/25/80/443/465/587/2525）+ <span className="font-mono text-indigo-300">mailnode-smtp-out</span>（出站 25/465/587）。VPS 打 <span className="font-mono">mail-node</span> tag 自动命中，旧规则会自动校正。</div>
                 <div>登录命令和私钥在「资源清单」页可复制/下载。</div>
               </div>
 
@@ -893,7 +852,7 @@ export default function Batch() {
       {step === 4 && (
         <div className="space-y-4">
           <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-sm text-amber-200">
-            等 A 记录 DNS 生效 1-5 分钟后再点。仅 <span className="font-mono">ptr_status</span> 未设置的 VPS 需要处理。
+            等 A 记录 DNS 生效 1-5 分钟后再点。GCP 多 NIC 只支持 nic0 公网 PTR；mail1~mail8 的 A/EHLO 会自动配置，额外 NIC PTR 不会重复重试。
           </div>
 
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -936,7 +895,7 @@ export default function Batch() {
                         <td className="px-2 py-1.5 text-slate-300 text-xs">{v.fqdn || '-'}</td>
                         <td className="px-2 py-1.5 text-slate-300 font-mono">{v.ip || '-'}</td>
                         <td className="px-2 py-1.5"><span className={statusBadge(v.deploy_status)}>{v.deploy_status}</span></td>
-                        <td className="px-2 py-1.5"><span className={statusBadge(v.ptr_status || '-')}>{v.ptr_status || '-'}</span></td>
+                        <td className="px-2 py-1.5"><span className={statusBadge(v.ptr_status || '-')} title={v.ptr_status === 'partial' ? 'nic0 PTR 真生效，nic1~7 GCP silent ignore（87.5% 流量 PTR 残缺）' : ''}>{v.ptr_status || '-'}</span></td>
                       </tr>
                     ))}
                   </tbody>
@@ -1022,8 +981,14 @@ export default function Batch() {
               <input type="checkbox" className="accent-indigo-500 mt-0.5"
                      checked={hideClientIP} onChange={e => setHideClientIP(e.target.checked)} />
               <div>
-                <div className="text-sm text-slate-200">🛡️ 屏蔽发件端真实 IP（推荐勾选）</div>
-                <div className="text-xs text-slate-500">移除 Received 链头部真实 IP，写入伪造链</div>
+                <div className="text-sm text-slate-200">
+                  🛡️ 屏蔽发件端真实 IP（{hideClientIP ? '已启用：trace_headers=false' : '关闭：透明中继暴露 IP'}）
+                </div>
+                <div className="text-xs text-slate-500">
+                  {hideClientIP
+                    ? '勾选：KumoMTA 不写客户端 IP 到 Received 头；配合 brutal-mailer Persona 伪造链使用'
+                    : '取消：KumoMTA 标准模式，Received 头会暴露发件端真实 IP（适合通知类邮件不伪造身份）'}
+                </div>
               </div>
             </label>
 

@@ -1,11 +1,17 @@
 import { useEffect, useState } from 'react'
-import { Inbox, FolderOpen, RefreshCw, Play } from 'lucide-react'
+import { Inbox, FolderOpen, RefreshCw, Play, Server, Clock, Trash2 } from 'lucide-react'
 import {
   ListVPS,
   // @ts-ignore - bindings 会在 wails build 时重新生成
   ExtractFromVPS,
   // @ts-ignore
+  ExtractFromVPSWithDelete,
+  // @ts-ignore
   GetExtractOutputDir,
+  // @ts-ignore
+  GetExtractSchedule,
+  // @ts-ignore
+  SetExtractSchedule,
 } from '../../wailsjs/go/main/App'
 import { BrowserOpenURL } from '../../wailsjs/runtime/runtime'
 import { main } from '../../wailsjs/go/models'
@@ -36,6 +42,16 @@ interface ExtractSummary {
   write_result: WriteResult
 }
 
+interface ScheduleCfg {
+  enabled: boolean
+  interval_min: number
+  delete_after: boolean
+  last_run_at?: string
+  last_run_status?: string
+  last_run_msg?: string
+  next_run_at?: string
+}
+
 export default function Extract() {
   const { toast } = useToast()
   const [vpsList, setVpsList] = useState<main.VPSInstanceDTO[]>([])
@@ -44,17 +60,63 @@ export default function Extract() {
   const [summary, setSummary] = useState<ExtractSummary | null>(null)
   const [outputDir, setOutputDir] = useState('')
 
-  const refresh = async () => {
+  // v0.1.77：手动提取删服务器日志开关 + 自动调度配置
+  const [deleteAfter, setDeleteAfter] = useState(true)
+  const [schedule, setSchedule] = useState<ScheduleCfg>({ enabled: false, interval_min: 15, delete_after: true })
+  const [scheduleSaving, setScheduleSaving] = useState(false)
+
+  const isExtractableVPS = (v: main.VPSInstanceDTO) =>
+    v.deploy_type === 'kumomta' &&
+    v.status !== 'deleted' &&
+    !!v.ip &&
+    ['success', 'mta_ready', 'ptr_ready'].includes(v.deploy_status || '')
+
+  const importFromResources = async (selectAll = false, notify = false) => {
     try {
       const v = await ListVPS()
-      // 只列出 KumoMTA 部署成功的（可提取的）
-      setVpsList((v || []).filter(x => x.deploy_type === 'kumomta' && x.deploy_status === 'success' && x.status !== 'deleted' && x.ip))
+      const usable = (v || []).filter(isExtractableVPS)
+      setVpsList(usable)
+      if (selectAll) setSelected(new Set(usable.map(x => x.id)))
+      else setSelected(prev => new Set([...Array.from(prev)].filter(id => usable.some(x => x.id === id))))
+      if (notify) toast('success', `已从资源清单导入 ${usable.length} 台可提取 VPS`)
     } catch (e: any) { toast('error', '加载 VPS 失败: ' + (e?.message || e)) }
+  }
+  const refresh = () => importFromResources(false, false)
+  const refreshSchedule = async () => {
+    try {
+      const s = await GetExtractSchedule() as ScheduleCfg
+      if (s) setSchedule({
+        enabled: !!s.enabled,
+        interval_min: s.interval_min || 15,
+        delete_after: s.delete_after !== false,
+        last_run_at: s.last_run_at,
+        last_run_status: s.last_run_status,
+        last_run_msg: s.last_run_msg,
+        next_run_at: s.next_run_at,
+      })
+    } catch {}
   }
   useEffect(() => {
     refresh()
     GetExtractOutputDir().then((d: string) => setOutputDir(d || '')).catch(() => {})
+    refreshSchedule()
+    // 每 30 秒刷新一次调度状态（看到自动提取的进度）
+    const t = setInterval(refreshSchedule, 30000)
+    return () => clearInterval(t)
   }, [])
+
+  const saveSchedule = async (next: ScheduleCfg) => {
+    setScheduleSaving(true)
+    try {
+      await SetExtractSchedule(next as any)
+      setSchedule(next)
+      toast('success', `自动提取已${next.enabled ? '启用' : '停用'}（间隔 ${next.interval_min} 分钟）`)
+    } catch (e: any) {
+      toast('error', '保存调度配置失败: ' + (e?.message || e))
+    } finally {
+      setScheduleSaving(false)
+    }
+  }
 
   const toggle = (id: string) => {
     setSelected(prev => {
@@ -73,14 +135,20 @@ export default function Extract() {
     setRunning(true)
     setSummary(null)
     try {
-      const r = await ExtractFromVPS(Array.from(selected)) as ExtractSummary
+      const r = await ExtractFromVPSWithDelete(Array.from(selected), deleteAfter) as ExtractSummary
       setSummary(r)
-      toast('success', `提取完成：跨 VPS 唯一邮箱 ${r.total_emails}`)
+      const tip = deleteAfter ? '（已删除服务器日志）' : ''
+      toast('success', `提取完成：跨 VPS 唯一邮箱 ${r.total_emails}${tip}`)
     } catch (e: any) {
       toast('error', '提取失败: ' + (e?.message || e))
     } finally {
       setRunning(false)
     }
+  }
+
+  const fmtTime = (iso?: string) => {
+    if (!iso) return '-'
+    try { return new Date(iso).toLocaleString('zh-CN', { hour12: false }) } catch { return iso }
   }
 
   const openFolder = async () => {
@@ -100,12 +168,22 @@ export default function Extract() {
         <div className="flex items-center gap-2">
           <Inbox size={20} className="text-indigo-400" />
           <h1 className="text-xl font-bold text-slate-100">邮箱提取</h1>
-          <span className="text-xs text-slate-500 ml-2">从 KumoMTA VPS 拉取日志，按域名分类输出 txt</span>
+          <span className="text-xs text-slate-500 ml-2">仅导出"成功投递（Delivery 250 OK）"的收件人，Bounce/Deferred 不输出</span>
         </div>
         <div className="inline-flex gap-2 items-center">
+          <label className="inline-flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none px-2 py-1.5 bg-slate-800/60 rounded-md border border-slate-700/40"
+                 title="提取成功后调用 SSH 删除 ≤ 已读 cursor 的所有日志文件（包括成功+失败），保留正在写入的最新文件">
+            <input type="checkbox" className="accent-rose-500" checked={deleteAfter} onChange={e => setDeleteAfter(e.target.checked)} />
+            <Trash2 size={12} className={deleteAfter ? 'text-rose-400' : 'text-slate-500'} />
+            提取后删服务器日志
+          </label>
           <button onClick={refresh}
                   className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
             <RefreshCw size={14} /> 刷新
+          </button>
+          <button onClick={() => importFromResources(true, true)}
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
+            <Server size={14} /> 从资源清单导入
           </button>
           <button onClick={openFolder}
                   title={outputDir || '输出目录'}
@@ -126,6 +204,49 @@ export default function Extract() {
         </div>
       )}
 
+      {/* v0.1.77：自动提取调度面板 */}
+      <div className="bg-[#1a1d27] rounded-lg border border-slate-700/50 p-3 mb-4">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <Clock size={14} className={schedule.enabled ? 'text-emerald-400' : 'text-slate-500'} />
+            <span className="text-sm text-slate-200 font-medium">自动提取</span>
+          </div>
+          <label className="inline-flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none">
+            <input type="checkbox" className="accent-emerald-500" disabled={scheduleSaving}
+                   checked={schedule.enabled}
+                   onChange={e => saveSchedule({ ...schedule, enabled: e.target.checked })} />
+            <span>{schedule.enabled ? '已启用' : '已停用'}</span>
+          </label>
+          <div className="flex items-center gap-1.5 text-xs text-slate-300">
+            <span>间隔</span>
+            <input type="number" min={1} max={1440} disabled={scheduleSaving}
+                   className="w-16 bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1 text-xs focus:border-indigo-500 outline-none"
+                   value={schedule.interval_min}
+                   onChange={e => setSchedule({ ...schedule, interval_min: Math.max(1, Math.min(1440, Number(e.target.value) || 15)) })}
+                   onBlur={() => saveSchedule(schedule)} />
+            <span>分钟</span>
+          </div>
+          <label className="inline-flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none">
+            <input type="checkbox" className="accent-rose-500" disabled={scheduleSaving}
+                   checked={schedule.delete_after}
+                   onChange={e => saveSchedule({ ...schedule, delete_after: e.target.checked })} />
+            <Trash2 size={12} className={schedule.delete_after ? 'text-rose-400' : 'text-slate-500'} />
+            <span>同时删服务器日志</span>
+          </label>
+          <div className="flex-1" />
+          <div className="text-[10px] text-slate-500 grid grid-cols-2 gap-x-3 gap-y-0.5 min-w-[260px]">
+            <span>上次：{fmtTime(schedule.last_run_at)}</span>
+            <span>下次：{fmtTime(schedule.next_run_at)}</span>
+            <span className="col-span-2 truncate" title={schedule.last_run_msg}>
+              {schedule.last_run_status === 'ok' ? '✅' : schedule.last_run_status === 'error' ? '❌' : '·'} {schedule.last_run_msg || '未运行'}
+            </span>
+          </div>
+        </div>
+        <div className="text-[10px] text-slate-500 mt-1.5">
+          启用后每 N 分钟自动从所有 KumoMTA VPS（success / mta_ready / ptr_ready）拉取日志、按域名分类追加到本地 txt。建议 ≥ 5 分钟避免频繁 SSH。
+        </div>
+      </div>
+
       {/* VPS 表 */}
       <div className="bg-[#1a1d27] rounded-lg border border-slate-700/50 overflow-hidden mb-4">
         <table className="w-full text-sm">
@@ -145,7 +266,7 @@ export default function Extract() {
           <tbody>
             {vpsList.length === 0 && (
               <tr><td colSpan={5} className="text-center px-3 py-6 text-slate-500">
-                暂无可提取 VPS（需 KumoMTA 类型且已部署成功）
+                暂无可提取 VPS（需 KumoMTA 类型，且状态为 success / mta_ready / ptr_ready）
               </td></tr>
             )}
             {vpsList.map(v => (

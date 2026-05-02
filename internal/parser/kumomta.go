@@ -51,8 +51,8 @@ func extractBMTaskID(h map[string]string) string {
 //	Bounce          → 硬退信，记入 BouncedLines 并按 SMTP 码分类
 //	TransientFailure → 软退信 deferred
 //
-// 同一封邮件的生命周期会产生多个事件（Reception + Delivery 或 Reception + Bounce），
-// 为避免重复统计邮箱，只在 Reception / Delivery 事件里 addEmail。
+// 同一封邮件的生命周期会产生多个事件（Reception + Delivery 或 Reception + Bounce）。
+// 邮箱导出只认 Delivery 事件，避免把已接收但后来退信的收件人写入结果。
 func ParseKumoMTAStream(r io.Reader) ParseResult {
 	result := ParseResult{}
 	seen := make(map[string]struct{})
@@ -94,20 +94,17 @@ func ParseKumoMTAStream(r io.Reader) ParseResult {
 		case "Reception":
 			// 相当于 Postfix status=sent，邮件进入 MTA 系统并被接收
 			result.SentLines++
-			if ev.Recipient != "" {
-				addEmail(strings.ToLower(strings.TrimSpace(ev.Recipient)), &result, seen)
-			}
 			if st := ensureBM(); st != nil {
 				st.Reception++
 			}
 		case "Delivery":
-			// 成功投递到远端 MX（250 OK），也加入邮箱集合（幂等）
+			// 成功投递到远端 MX（250 OK），只有这类收件人进入导出邮箱集合。
 			if ev.Recipient != "" {
 				addEmail(strings.ToLower(strings.TrimSpace(ev.Recipient)), &result, seen)
 			}
 		case "Bounce":
 			result.BouncedLines++
-			reason := classifyKumoBounce(ev.Response.Code, ev.Response.Content)
+			reason := ClassifyKumoBounce(ev.Response.Code, ev.Response.Content)
 			bounceCounts[reason]++
 
 			if at := strings.LastIndex(ev.Recipient, "@"); at >= 0 {
@@ -181,10 +178,10 @@ func DecompressZstd(r io.Reader) (io.ReadCloser, error) {
 	return dec.IOReadCloser(), nil
 }
 
-// classifyKumoBounce 把 KumoMTA 的 Bounce 事件分类成可读原因
+// ClassifyKumoBounce 把 KumoMTA 的 Bounce 事件分类成可读原因
 // KumoMTA 的 response.content 往往包含目标 MX 返回的完整文本，语义上和 Postfix
 // 日志里的 "said: ..." 一致，所以分类规则可以保持一致。
-func classifyKumoBounce(code int, content string) string {
+func ClassifyKumoBounce(code int, content string) string {
 	lower := strings.ToLower(content)
 	codeStr := strconv.Itoa(code)
 

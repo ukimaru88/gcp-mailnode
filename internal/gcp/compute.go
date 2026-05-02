@@ -17,22 +17,38 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// NICSpec 单个网络接口的配置（v0.1.57 多 NIC 用）
+type NICSpec struct {
+	NetworkName string // "default" / "mail-vpc-1" / ...
+	SubnetURL   string // projects/<proj>/regions/<region>/subnetworks/<name>（可空）
+	StaticIP    string // 该 NIC 的外部静态 IP（可空 → 临时 IP）
+}
+
 // InstanceSpec 创建 VM 时的参数
 type InstanceSpec struct {
 	Name          string
 	Zone          string
-	MachineType   string // 如 "e2-micro"、"n1-standard-1"
+	MachineType   string // 如 "e2-micro"、"n1-standard-1"、"n2-custom-8-16384"
 	ImageFamily   string // 如 "debian-12"
 	ImageProject  string // 如 "debian-cloud"
 	DiskSizeGB    int64
 	DiskType      string // pd-standard / pd-balanced / pd-ssd（默认 pd-balanced）
 	Tags          []string
 	StartupScript string
-	StaticIP      string // 外部 IP 字符串（已经预留）
-	NetworkName   string // 一般填 "default"
+	StaticIP      string // 单 NIC 模式用；NICs 非空时忽略
+	NetworkName   string // 单 NIC 模式用；NICs 非空时忽略
 	// v0.1.54：Spot VM 支持（"STANDARD" 或 "SPOT"，空字符串视为 STANDARD）
 	// SPOT 时 InstanceTerminationAction=DELETE（业务 3 天即抛，DELETE 比 STOP 省 IP 持有费）
 	ProvisioningModel string
+	// v0.1.57：多 NIC 支持。非空时取代单 NIC 路径，每元素一个 NetworkInterface。
+	NICs []NICSpec
+}
+
+// NICInfo 单个 NIC 的内/外网 IP（v0.1.57 多 NIC 用）
+type NICInfo struct {
+	InternalIP string // GCP 子网内网 IP
+	ExternalIP string // 外部静态 IP（access config NatIP）
+	NICName    string // GCP 内部 NIC 名（nic0/nic1/...）
 }
 
 // InstanceInfo 实例概要
@@ -41,12 +57,13 @@ type InstanceInfo struct {
 	Zone            string
 	Status          string
 	MachineType     string
-	ExternalIP      string
-	InternalIP      string
+	ExternalIP      string // = NICs[0].ExternalIP（兼容旧调用）
+	InternalIP      string // = NICs[0].InternalIP（兼容旧调用）
 	SelfLink        string
 	CreatedAt       time.Time
 	Tags            []string
 	TagsFingerprint string // 设置 tags 时需要带上当前 fingerprint（GCP 乐观锁）
+	NICs            []NICInfo
 }
 
 // CreateInstance 创建 VM
@@ -88,24 +105,7 @@ func (c *Client) CreateInstance(ctx context.Context, spec InstanceSpec) (Instanc
 				},
 			},
 		},
-		NetworkInterfaces: []*computepb.NetworkInterface{
-			{
-				Network: proto.String(networkURL),
-				AccessConfigs: []*computepb.AccessConfig{
-					{
-						Name: proto.String("External NAT"),
-						Type: proto.String("ONE_TO_ONE_NAT"),
-						NatIP: func() *string {
-							if spec.StaticIP == "" {
-								return nil
-							}
-							s := spec.StaticIP
-							return &s
-						}(),
-					},
-				},
-			},
-		},
+		NetworkInterfaces: buildNetworkInterfaces(spec, networkURL),
 	}
 
 	if spec.StartupScript != "" {
@@ -140,6 +140,9 @@ func (c *Client) CreateInstance(ctx context.Context, spec InstanceSpec) (Instanc
 		InstanceResource: instance,
 	}
 
+	if len(spec.NICs) > 0 {
+		logger.Info("GCP CreateInstance multi-NIC name=%s nicCount=%d", spec.Name, len(spec.NICs))
+	}
 	logger.Info("GCP CreateInstance name=%s zone=%s machineType=%s", spec.Name, spec.Zone, spec.MachineType)
 	op, err := cli.Insert(ctx, req)
 	if err != nil {
@@ -151,6 +154,50 @@ func (c *Client) CreateInstance(ctx context.Context, spec InstanceSpec) (Instanc
 
 	logger.Info("GCP CreateInstance 完成 name=%s", spec.Name)
 	return c.GetInstance(ctx, spec.Zone, spec.Name)
+}
+
+// buildNetworkInterfaces 按 spec.NICs 长度展开多 NIC；非空时优先，否则走单 NIC 兼容路径。
+func buildNetworkInterfaces(spec InstanceSpec, defaultNetworkURL string) []*computepb.NetworkInterface {
+	if len(spec.NICs) > 0 {
+		out := make([]*computepb.NetworkInterface, 0, len(spec.NICs))
+		for _, n := range spec.NICs {
+			netURL := "global/networks/" + n.NetworkName
+			ni := &computepb.NetworkInterface{
+				Network: proto.String(netURL),
+			}
+			if n.SubnetURL != "" {
+				ni.Subnetwork = proto.String(n.SubnetURL)
+			}
+			ac := &computepb.AccessConfig{
+				Name: proto.String("External NAT"),
+				Type: proto.String("ONE_TO_ONE_NAT"),
+			}
+			if n.StaticIP != "" {
+				ip := n.StaticIP
+				ac.NatIP = &ip
+			}
+			ni.AccessConfigs = []*computepb.AccessConfig{ac}
+			out = append(out, ni)
+		}
+		return out
+	}
+	ni := &computepb.NetworkInterface{
+		Network: proto.String(defaultNetworkURL),
+		AccessConfigs: []*computepb.AccessConfig{
+			{
+				Name: proto.String("External NAT"),
+				Type: proto.String("ONE_TO_ONE_NAT"),
+				NatIP: func() *string {
+					if spec.StaticIP == "" {
+						return nil
+					}
+					s := spec.StaticIP
+					return &s
+				}(),
+			},
+		},
+	}
+	return []*computepb.NetworkInterface{ni}
 }
 
 // GetInstance 获取实例详情
@@ -261,19 +308,22 @@ func instanceToInfo(inst *computepb.Instance) InstanceInfo {
 	if mt := inst.GetMachineType(); mt != "" {
 		info.MachineType = path.Base(mt)
 	}
-	// 取第一个 AccessConfig 的 NatIP
-	for _, ni := range inst.GetNetworkInterfaces() {
-		if info.InternalIP == "" {
-			info.InternalIP = ni.GetNetworkIP()
+	// v0.1.57：填充全部 NIC 信息（NICs[0] 是 nic0）；同时把 nic0 的 IP 投到顶层兼容字段
+	for idx, ni := range inst.GetNetworkInterfaces() {
+		nicInfo := NICInfo{
+			InternalIP: ni.GetNetworkIP(),
+			NICName:    ni.GetName(),
 		}
 		for _, ac := range ni.GetAccessConfigs() {
 			if ip := ac.GetNatIP(); ip != "" {
-				info.ExternalIP = ip
+				nicInfo.ExternalIP = ip
 				break
 			}
 		}
-		if info.ExternalIP != "" {
-			break
+		info.NICs = append(info.NICs, nicInfo)
+		if idx == 0 {
+			info.InternalIP = nicInfo.InternalIP
+			info.ExternalIP = nicInfo.ExternalIP
 		}
 	}
 	if ts := inst.GetCreationTimestamp(); ts != "" {

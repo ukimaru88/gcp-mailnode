@@ -27,6 +27,7 @@ type VPSInstanceDTO struct {
 	MachineType   string    `json:"machine_type"`
 	Status        string    `json:"status"`
 	IP            string    `json:"ip"`
+	InternalIP    string    `json:"internal_ip"`
 	FQDN          string    `json:"fqdn"`
 	RootPassword  string    `json:"root_password"`
 	DeployStatus  string    `json:"deploy_status"`
@@ -54,6 +55,8 @@ type StaticIPDTO struct {
 	DNSBLResult     string    `json:"dnsbl_result"`
 	DNSBLHitLists   string    `json:"dnsbl_hit_lists"`
 	BatchID         string    `json:"batch_id"`
+	SlotGroup       string    `json:"slot_group"` // v0.1.57：多 NIC 模式下，同 group 的 IP 必须整组保留或释放
+	NICIndex        int       `json:"nic_index"`  // v0.1.57：组内位置（0..nic_count-1）
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -77,7 +80,7 @@ func (a *App) ListVPS() ([]VPSInstanceDTO, error) {
 		return nil, err
 	}
 	rows, err := db.Query(
-		`SELECT id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, fqdn, root_password, deploy_status, deploy_error, COALESCE(ptr_status,'none'), smtp_account, smtp_password, dkim_public_key, aliyun_cred_id, domain, COALESCE(batch_id,''), COALESCE(deploy_type,'kumomta'), created_at FROM vps_instances ORDER BY created_at DESC`)
+		`SELECT id, gcp_cred_id, gcp_instance_id, name, region, zone, machine_type, status, ip, COALESCE(internal_ip,''), fqdn, root_password, deploy_status, deploy_error, COALESCE(ptr_status,'none'), smtp_account, smtp_password, dkim_public_key, aliyun_cred_id, domain, COALESCE(batch_id,''), COALESCE(deploy_type,'kumomta'), created_at FROM vps_instances ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +88,7 @@ func (a *App) ListVPS() ([]VPSInstanceDTO, error) {
 	out := []VPSInstanceDTO{}
 	for rows.Next() {
 		var v VPSInstanceDTO
-		if err := rows.Scan(&v.ID, &v.GCPCredID, &v.GCPInstanceID, &v.Name, &v.Region, &v.Zone, &v.MachineType, &v.Status, &v.IP, &v.FQDN, &v.RootPassword, &v.DeployStatus, &v.DeployError, &v.PTRStatus, &v.SMTPAccount, &v.SMTPPassword, &v.DKIMPublicKey, &v.AliyunCredID, &v.Domain, &v.BatchID, &v.DeployType, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.GCPCredID, &v.GCPInstanceID, &v.Name, &v.Region, &v.Zone, &v.MachineType, &v.Status, &v.IP, &v.InternalIP, &v.FQDN, &v.RootPassword, &v.DeployStatus, &v.DeployError, &v.PTRStatus, &v.SMTPAccount, &v.SMTPPassword, &v.DKIMPublicKey, &v.AliyunCredID, &v.Domain, &v.BatchID, &v.DeployType, &v.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -103,7 +106,9 @@ func (a *App) ListStaticIPs() ([]StaticIPDTO, error) {
 		return nil, err
 	}
 	rows, err := db.Query(
-		`SELECT id, gcp_cred_id, gcp_address_name, ip, region, status, bound_instance_id, dnsbl_result, dnsbl_hit_lists, COALESCE(batch_id,''), created_at FROM static_ips ORDER BY created_at DESC`)
+		`SELECT id, gcp_cred_id, gcp_address_name, ip, region, status, bound_instance_id, dnsbl_result, dnsbl_hit_lists,
+		        COALESCE(batch_id,''), COALESCE(slot_group,''), COALESCE(nic_index,0), created_at
+		   FROM static_ips ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +116,7 @@ func (a *App) ListStaticIPs() ([]StaticIPDTO, error) {
 	out := []StaticIPDTO{}
 	for rows.Next() {
 		var s StaticIPDTO
-		if err := rows.Scan(&s.ID, &s.GCPCredID, &s.GCPAddressName, &s.IP, &s.Region, &s.Status, &s.BoundInstanceID, &s.DNSBLResult, &s.DNSBLHitLists, &s.BatchID, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.GCPCredID, &s.GCPAddressName, &s.IP, &s.Region, &s.Status, &s.BoundInstanceID, &s.DNSBLResult, &s.DNSBLHitLists, &s.BatchID, &s.SlotGroup, &s.NICIndex, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -204,21 +209,23 @@ func (a *App) FixMailNodeTag(vpsIDs []string) (int, error) {
 				break
 			}
 		}
-		if has {
-			logger.Info("VM %s 已有 %s tag，跳过", name, gcp.MailNodeTag)
-			done++
+		if !has {
+			newTags := append([]string{}, info.Tags...)
+			newTags = append(newTags, gcp.MailNodeTag)
+			if err := cli.SetInstanceTags(ctx, zone, name, newTags, info.TagsFingerprint); err != nil {
+				logger.Warn("SetTags %s 失败: %v", name, err)
+				continue
+			}
+			logger.Info("VM %s 已补 %s tag", name, gcp.MailNodeTag)
+		} else {
+			logger.Info("VM %s 已有 %s tag，继续校正防火墙", name, gcp.MailNodeTag)
+		}
+		if err := cli.EnsureMailNodeFirewall(ctx, "default"); err != nil {
+			logger.Warn("校正 firewall 失败 %s: %v", name, err)
 			continue
 		}
-		newTags := append([]string{}, info.Tags...)
-		newTags = append(newTags, gcp.MailNodeTag)
-		if err := cli.SetInstanceTags(ctx, zone, name, newTags, info.TagsFingerprint); err != nil {
-			logger.Warn("SetTags %s 失败: %v", name, err)
-			continue
-		}
-		// 确保 project 里有 firewall 规则（幂等）
-		_ = cli.EnsureMailNodeFirewall(ctx)
 		done++
-		logger.Info("✅ VM %s 已补 %s tag", name, gcp.MailNodeTag)
+		logger.Info("✅ VM %s 的 %s tag / firewall 已修复", name, gcp.MailNodeTag)
 	}
 	return done, nil
 }
@@ -271,15 +278,39 @@ func (a *App) BatchDelete(resourceType string, ids []string) (int, error) {
 						logger.Warn("删除 VPS %s panic: %v", vpsID, r)
 					}
 				}()
-				var credID, name, zone, region, addrName, staticIPID string
-				row := db.QueryRow(`SELECT v.gcp_cred_id, v.name, v.zone, COALESCE(s.region,''), COALESCE(s.gcp_address_name,''), COALESCE(s.id,'')
-					FROM vps_instances v
-					LEFT JOIN static_ips s ON s.bound_instance_id=v.id
-					WHERE v.id=?`, vpsID)
-				if err := row.Scan(&credID, &name, &zone, &region, &addrName, &staticIPID); err != nil {
+				var credID, name, zone string
+				row := db.QueryRow(`SELECT gcp_cred_id, name, zone FROM vps_instances WHERE id=?`, vpsID)
+				if err := row.Scan(&credID, &name, &zone); err != nil {
 					logger.Warn("查询 VPS %s 失败: %v", vpsID, err)
 					return
 				}
+				type boundIP struct {
+					id       string
+					region   string
+					addrName string
+					ip       string
+				}
+				ipRows, err := db.Query(`SELECT id, region, gcp_address_name, ip FROM static_ips WHERE bound_instance_id=?`, vpsID)
+				if err != nil {
+					logger.Warn("查询 VPS %s 绑定静态 IP 失败: %v", vpsID, err)
+					return
+				}
+				var boundIPs []boundIP
+				for ipRows.Next() {
+					var r boundIP
+					if err := ipRows.Scan(&r.id, &r.region, &r.addrName, &r.ip); err != nil {
+						ipRows.Close()
+						logger.Warn("读取 VPS %s 绑定静态 IP 失败: %v", vpsID, err)
+						return
+					}
+					boundIPs = append(boundIPs, r)
+				}
+				if err := ipRows.Err(); err != nil {
+					ipRows.Close()
+					logger.Warn("遍历 VPS %s 绑定静态 IP 失败: %v", vpsID, err)
+					return
+				}
+				ipRows.Close()
 				cli, err := getCli(credID)
 				if err != nil {
 					logger.Warn("加载 GCP 客户端失败 %s: %v", credID, err)
@@ -292,17 +323,36 @@ func (a *App) BatchDelete(resourceType string, ids []string) (int, error) {
 					}
 					logger.Info("VM %s 在云端已不存在，仅清理本地状态", name)
 				}
-				if staticIPID != "" && addrName != "" && region != "" {
-					if err := cli.ReleaseStaticAddress(ctx, region, addrName); err != nil {
-						if !gcp.IsNotFound(err) {
-							logger.Warn("释放 VPS 绑定静态 IP %s 失败: %v", addrName, err)
-							return
-						}
-						logger.Info("IP %s 在云端已不存在，仅清理本地状态", addrName)
+				releaseFailed := false
+				for _, r := range boundIPs {
+					if r.id == "" || r.addrName == "" || r.region == "" {
+						continue
 					}
-					_, _ = db.Exec(`UPDATE static_ips SET status='released', bound_instance_id='' WHERE id=?`, staticIPID)
+					var releaseErr error
+					for attempt := 1; attempt <= 3; attempt++ {
+						releaseErr = cli.ReleaseStaticAddress(ctx, r.region, r.addrName)
+						if releaseErr == nil || gcp.IsNotFound(releaseErr) {
+							break
+						}
+						if attempt < 3 {
+							time.Sleep(time.Duration(attempt*3) * time.Second)
+						}
+					}
+					if releaseErr != nil && !gcp.IsNotFound(releaseErr) {
+						logger.Warn("释放 VPS %s 绑定静态 IP %s (%s) 失败: %v", name, r.ip, r.addrName, releaseErr)
+						releaseFailed = true
+						continue
+					}
+					if gcp.IsNotFound(releaseErr) {
+						logger.Info("IP %s 在云端已不存在，仅清理本地状态", r.addrName)
+					}
+					_, _ = db.Exec(`UPDATE static_ips SET status='released', bound_instance_id='' WHERE id=?`, r.id)
 				}
 				_, _ = db.Exec(`UPDATE vps_instances SET status='deleted' WHERE id=?`, vpsID)
+				if releaseFailed {
+					logger.Warn("VPS %s 已删除，但仍有绑定静态 IP 释放失败，请到 IP 列表或 GCP Console 复查", name)
+					return
+				}
 				atomic.AddInt32(&okCount, 1)
 			}()
 		}
@@ -412,6 +462,7 @@ func (a *App) BatchDelete(resourceType string, ids []string) (int, error) {
 //
 //	"smtp"      → ip:port:user:pass（兼容老 brutal-mailer）
 //	"smtp_v2"   → ip:port:user:pass:persona_type:hide_ip（brutal-mailer v2.3.37+，可直接按账号绑定 persona）
+//	"smtp_v3"   → ip:port:user:pass:persona_type:hide_ip:unsub_url:unsub_secret（v0.1.74+，含一键退订）
 //	"toolkit"   → fqdn----ip----root----rootpass（mail-toolkit 格式）
 func (a *App) ExportSMTP(format string) (string, error) {
 	db, err := requireDB()
@@ -419,9 +470,10 @@ func (a *App) ExportSMTP(format string) (string, error) {
 		return "", err
 	}
 	// 兼容：一键模式 success；4 阶段 mta_ready（Stage C 完）；ptr_ready（Stage D 完）
+	// v0.1.74：加 unsub_secret 字段（缺失时为空字符串）
 	rows, err := db.Query(`
-        SELECT v.ip, v.fqdn, v.smtp_account, v.smtp_password, v.root_password,
-               COALESCE(v.hide_client_ip, 1), COALESCE(p.name, '')
+        SELECT v.ip, v.fqdn, v.domain, v.smtp_account, v.smtp_password, v.root_password,
+               COALESCE(v.hide_client_ip, 1), COALESCE(p.name, ''), COALESCE(v.unsub_secret, '')
         FROM vps_instances v
         LEFT JOIN personas p ON p.id = v.persona_id
         WHERE v.deploy_status IN ('success', 'mta_ready', 'ptr_ready')
@@ -434,10 +486,10 @@ func (a *App) ExportSMTP(format string) (string, error) {
 	var lines []string
 	for rows.Next() {
 		var (
-			ip, fqdn, acct, pass, rootPwd, personaName string
-			hideIP                                     int
+			ip, fqdn, domain, acct, pass, rootPwd, personaName, unsubSecret string
+			hideIP                                                          int
 		)
-		if err := rows.Scan(&ip, &fqdn, &acct, &pass, &rootPwd, &hideIP, &personaName); err != nil {
+		if err := rows.Scan(&ip, &fqdn, &domain, &acct, &pass, &rootPwd, &hideIP, &personaName, &unsubSecret); err != nil {
 			return "", err
 		}
 		// personaName → brutal-mailer 的 persona_type 字面量
@@ -447,6 +499,14 @@ func (a *App) ExportSMTP(format string) (string, error) {
 			lines = append(lines, fmt.Sprintf("%s----%s----root----%s", fqdn, ip, rootPwd))
 		case "smtp_v2":
 			lines = append(lines, fmt.Sprintf("%s:587:%s:%s:%s:%d", ip, acct, pass, personaType, hideIP))
+		case "smtp_v3":
+			// v0.1.74：含一键退订。退订 URL 用根域 https://<域>/u
+			unsubURL := ""
+			if unsubSecret != "" && domain != "" {
+				unsubURL = fmt.Sprintf("https://%s/u", domain)
+			}
+			lines = append(lines, fmt.Sprintf("%s:587:%s:%s:%s:%d:%s:%s",
+				ip, acct, pass, personaType, hideIP, unsubURL, unsubSecret))
 		default: // smtp (老格式)
 			lines = append(lines, fmt.Sprintf("%s:587:%s:%s", ip, acct, pass))
 		}

@@ -444,7 +444,7 @@ func runSlot(
 		diskType = "pd-balanced"
 	}
 
-	if err := gcpClient.EnsureMailNodeFirewall(ctx); err != nil {
+	if err := gcpClient.EnsureMailNodeFirewall(ctx, "default"); err != nil {
 		log("WARN", "确保防火墙规则失败: %v", err)
 	}
 

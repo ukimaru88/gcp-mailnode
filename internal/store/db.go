@@ -228,6 +228,10 @@ func Init(dataDir string) error {
 		`ALTER TABLE vps_instances ADD COLUMN additional_ips_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE static_ips ADD COLUMN nic_index INTEGER DEFAULT 0`,
 		`ALTER TABLE static_ips ADD COLUMN slot_group TEXT DEFAULT ''`,
+		// v0.1.74：退订服务 HMAC 密钥（每台 VPS 独立生成），smtp_v3 导出格式时一并导出给 brutal-mailer
+		`ALTER TABLE vps_instances ADD COLUMN unsub_secret TEXT DEFAULT ''`,
+		// v0.1.74：vps_templates 加 visible 字段，老模板隐藏不影响老 VPS 引用
+		`ALTER TABLE vps_templates ADD COLUMN visible INTEGER DEFAULT 1`,
 	}
 	for _, m := range migrations {
 		if _, err := conn.Exec(m); err != nil {

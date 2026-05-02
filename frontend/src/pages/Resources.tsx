@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { RefreshCw, Trash2, Globe, Settings2, X } from 'lucide-react'
+import { RefreshCw, Trash2, Globe, Settings2, X, Terminal } from 'lucide-react'
 import {
   ListVPS, ListStaticIPs, ListDNSRecords, BatchDelete,
   // @ts-ignore - bindings 会在 wails build 时重新生成
@@ -12,6 +12,8 @@ import {
   FixMailNodeTag,
   // @ts-ignore
   CleanupOrphanResources,
+  // @ts-ignore
+  DiagnoseKumoMTA,
 } from '../../wailsjs/go/main/App'
 import { main } from '../../wailsjs/go/models'
 import { useToast } from '../components/Toast'
@@ -27,12 +29,22 @@ const statusBadge = (s: string) => {
     pending: 'bg-amber-500/20 text-amber-300',
     error: 'bg-red-500/20 text-red-300',
     success: 'bg-green-500/20 text-green-300',
+    set: 'bg-green-500/20 text-green-300',
+    partial: 'bg-orange-500/20 text-orange-300',
     failed: 'bg-red-500/20 text-red-300',
     reserved: 'bg-sky-500/20 text-sky-300',
     in_use: 'bg-indigo-500/20 text-indigo-300',
     released: 'bg-slate-500/20 text-slate-400',
   }
   return `px-1.5 py-0.5 rounded text-xs ${map[s] || 'bg-slate-500/20 text-slate-400'}`
+}
+
+const ptrStatusTitle = (s: string) => {
+  if (s === 'partial') return 'nic0 PTR 真生效，但 nic1~7 GCP silent ignore（dig -x 反解仍是 *.bc.googleusercontent.com）。87.5% 出站流量 PTR 残缺，建议改用单 NIC 多 VM 架构'
+  if (s === 'set') return '所有 NIC 的 PTR 经反向 DNS 校验，全部真生效'
+  if (s === 'failed') return 'nic0 PTR 设置失败，可在 Stage D 手动重试'
+  if (s === 'pending') return 'PTR 设置进行中'
+  return ''
 }
 
 export default function Resources() {
@@ -53,6 +65,9 @@ export default function Resources() {
   const [personas, setPersonas] = useState<any[]>([])
   const [personaID, setPersonaID] = useState('')
   const [hideClientIP, setHideClientIP] = useState(true)
+  const [diagOpen, setDiagOpen] = useState(false)
+  const [diagLoading, setDiagLoading] = useState(false)
+  const [diagResult, setDiagResult] = useState<any>(null)
 
   const refresh = async () => {
     try {
@@ -119,7 +134,7 @@ export default function Resources() {
     if (selected.size === 0) { toast('warning', '请先勾选 VPS'); return }
     try {
       const n = await FixMailNodeTag(Array.from(selected))
-      toast('success', `已修复 ${n} 台 VPS 的 mail-node tag（25/587/465 等端口现在应可访问）`)
+      toast('success', `已修复 ${n} 台 VPS 的 mail-node tag / 防火墙（25/587/465 等端口现在应可访问）`)
       await refresh()
     } catch (e: any) { toast('error', '修复 Tag 失败: ' + (e?.message || e)) }
   }
@@ -145,6 +160,26 @@ export default function Resources() {
       setDeployModalOpen(false)
     } catch (e: any) {
       toast('error', '部署失败: ' + (e?.message || e))
+    }
+  }
+
+  const diagnoseKumoMTA = async () => {
+    if (selected.size !== 1) { toast('warning', '请选择 1 台 VPS 诊断'); return }
+    const id = Array.from(selected)[0]
+    setDiagOpen(true)
+    setDiagLoading(true)
+    setDiagResult(null)
+    try {
+      const r = await DiagnoseKumoMTA(id)
+      setDiagResult(r)
+      toast(r?.ok ? 'success' : 'warning', r?.summary || '诊断完成')
+      await refresh()
+    } catch (e: any) {
+      const msg = e?.message || String(e)
+      setDiagResult({ ok: false, summary: '诊断失败: ' + msg, detail: msg })
+      toast('error', '诊断失败: ' + msg)
+    } finally {
+      setDiagLoading(false)
     }
   }
 
@@ -177,9 +212,9 @@ export default function Resources() {
           {tab === 'vps' && (
             <>
               <button onClick={fixTag} disabled={selected.size === 0}
-                      title="给 VPS 补打 mail-node network tag，让 25/587/465 等端口通过 GCP 防火墙"
+                      title="给 VPS 补打 mail-node network tag，并校正 GCP 防火墙到 0.0.0.0/0 + 25/587/465"
                       className="bg-amber-600 hover:bg-amber-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
-                🔧 修复 Tag ({selected.size})
+                🔧 修复 Tag/防火墙 ({selected.size})
               </button>
               <button onClick={batchPTR} disabled={selected.size === 0}
                       className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
@@ -188,6 +223,10 @@ export default function Resources() {
               <button onClick={openDeployModal} disabled={selected.size === 0}
                       className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
                 <Settings2 size={14} /> 批量部署 KumoMTA ({selected.size})
+              </button>
+              <button onClick={diagnoseKumoMTA} disabled={selected.size !== 1}
+                      className="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-100 rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
+                <Terminal size={14} /> 诊断 KumoMTA
               </button>
             </>
           )}
@@ -267,7 +306,7 @@ export default function Resources() {
                       <td className="px-3 py-2 text-slate-300 font-mono text-xs">{v.ip || '-'}</td>
                       <td className="px-3 py-2 text-slate-300 text-xs">{v.fqdn || '-'}</td>
                       <td className="px-3 py-2"><span className={statusBadge(v.deploy_status)}>{v.deploy_status}</span></td>
-                      <td className="px-3 py-2"><span className={statusBadge(v.ptr_status || '-')}>{v.ptr_status || '-'}</span></td>
+                      <td className="px-3 py-2"><span className={statusBadge(v.ptr_status || '-')} title={ptrStatusTitle(v.ptr_status || '')}>{v.ptr_status || '-'}</span></td>
                       <td className="px-3 py-2 text-red-300 text-xs max-w-xs truncate" title={v.deploy_error}>{v.deploy_error || '-'}</td>
                       <td className="px-3 py-2 text-slate-500 text-xs">{fmtDate(v.created_at)}</td>
                     </tr>
@@ -375,6 +414,41 @@ export default function Resources() {
               <button onClick={confirmDeploy}
                       className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-md px-3 py-1.5 text-sm">
                 开始部署
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {diagOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-[#1a1d27] rounded-xl border border-slate-700/50 w-full max-w-4xl max-h-[86vh] p-5 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold text-slate-100 inline-flex items-center gap-2">
+                <Terminal size={16} /> KumoMTA 诊断
+              </h3>
+              <button onClick={() => setDiagOpen(false)} className="text-slate-500 hover:text-slate-300">
+                <X size={16} />
+              </button>
+            </div>
+            {diagLoading && <div className="text-sm text-slate-300">正在通过 SSH 读取 KumoMTA 状态、日志和 DKIM 权限...</div>}
+            {diagResult && (
+              <>
+                <div className={`rounded-md border px-3 py-2 text-sm ${diagResult.ok ? 'border-green-500/40 bg-green-500/10 text-green-200' : 'border-amber-500/40 bg-amber-500/10 text-amber-100'}`}>
+                  {diagResult.summary || '诊断完成'}
+                  <div className="mt-1 text-xs text-slate-400">
+                    外网 IP: {diagResult.ip || '-'} / 内网 IP: {diagResult.internal_ip || '-'} / FQDN: {diagResult.fqdn || '-'}
+                  </div>
+                </div>
+                <pre className="flex-1 overflow-auto bg-slate-950 border border-slate-700 rounded-md p-3 text-xs text-slate-300 whitespace-pre-wrap">
+{diagResult.detail || ''}
+                </pre>
+              </>
+            )}
+            <div className="flex justify-end">
+              <button onClick={() => setDiagOpen(false)}
+                      className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-sm">
+                关闭
               </button>
             </div>
           </div>

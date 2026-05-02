@@ -14,24 +14,24 @@ import (
 
 // VPSTemplateDTO 模板 DTO
 type VPSTemplateDTO struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Regions        []string  `json:"regions"`
-	AutoSpread     bool      `json:"auto_spread"`
-	MachineType    string    `json:"machine_type"`
-	ImageFamily    string    `json:"image_family"`
-	ImageProject   string    `json:"image_project"`
-	DiskSizeGB     int64     `json:"disk_size_gb"`
-	DiskType       string    `json:"disk_type"` // pd-standard / pd-balanced / pd-ssd
-	Tags           []string  `json:"tags"`
-	MetadataScript string    `json:"metadata_script"`
-	RootPassword   string    `json:"root_password"`
-	DeployType     string    `json:"deploy_type"` // kumomta（纯发信）/ mailcow（收发一体）
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Regions        []string `json:"regions"`
+	AutoSpread     bool     `json:"auto_spread"`
+	MachineType    string   `json:"machine_type"`
+	ImageFamily    string   `json:"image_family"`
+	ImageProject   string   `json:"image_project"`
+	DiskSizeGB     int64    `json:"disk_size_gb"`
+	DiskType       string   `json:"disk_type"` // pd-standard / pd-balanced / pd-ssd
+	Tags           []string `json:"tags"`
+	MetadataScript string   `json:"metadata_script"`
+	RootPassword   string   `json:"root_password"`
+	DeployType     string   `json:"deploy_type"` // kumomta（纯发信）/ mailcow（收发一体）
 	// v0.1.54
-	ProvisioningModel string `json:"provisioning_model"` // STANDARD（默认）/ SPOT（73% off，可被抢占）
-	NICCount          int    `json:"nic_count"`          // 1（默认）/ 8（仅 n1-standard-8 + Batch 2 多 NIC 启用）
-	IsPreset       bool      `json:"is_preset"`
-	CreatedAt      time.Time `json:"created_at"`
+	ProvisioningModel string    `json:"provisioning_model"` // STANDARD（默认）/ SPOT（73% off，可被抢占）
+	NICCount          int       `json:"nic_count"`          // 1（默认）/ 8（仅 n1-standard-8 + Batch 2 多 NIC 启用）
+	IsPreset          bool      `json:"is_preset"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // SaveVPSTemplate 保存（id 为空则新建，否则更新）
@@ -102,13 +102,16 @@ func (a *App) ListVPSTemplates() ([]VPSTemplateDTO, error) {
 	if err != nil {
 		return nil, err
 	}
+	// v0.1.74：visible=0 隐藏老预设，UI 下拉只列可见模板；老 VPS 资源页通过 GetVPSTemplate(id) 仍能查到隐藏模板信息
 	rows, err := db.Query(
 		`SELECT id, name, regions_json, auto_spread, machine_type, image_family, image_project, disk_size_gb,
 		        COALESCE(disk_type,'pd-balanced'), tags_json, metadata_script, root_password,
 		        COALESCE(deploy_type,'kumomta'),
 		        COALESCE(provisioning_model,'STANDARD'), COALESCE(nic_count,1),
 		        is_preset, created_at
-		   FROM vps_templates ORDER BY is_preset DESC, created_at DESC`)
+		   FROM vps_templates
+		   WHERE COALESCE(visible,1)=1
+		   ORDER BY is_preset DESC, created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -167,75 +170,80 @@ func ensurePresetTemplates() error {
 		_, _ = db.Exec(`DELETE FROM vps_templates WHERE is_preset=1 AND name=?`, n)
 	}
 
-	// 预设：KumoMTA 2 档（纯发信）+ mailcow 2 档（收发一体）+ Spot 短期省钱档
+	// v0.1.74：模板大瘦身——只保留一个推荐预设（n1-standard-8 + Spot + 8 NIC）。
+	// 老的 5 个预设保留代码 + DB 行但 visible=0 隐藏，UI 不再列出，老 VPS 资源页查询模板信息不受影响。
+	hideOldNames := []string{
+		"日本主力发信机 KumoMTA（5万/小时）",
+		"日本高性能发信机 KumoMTA（10万/小时）",
+		"日本 Spot 入门 KumoMTA（最便宜，73% off）",
+		"日本收发一体 mailcow（8GB，IMAP/SMTP）",
+		"日本收发一体 mailcow Pro（16GB）",
+		// v0.1.57 老名字：旧版 Spot 8 IP 走 n2-custom，被 v0.1.74 的 n1-standard-8 替代
+		"日本 Spot 8 核 16G × 8 IP KumoMTA（短期批量）",
+		// v0.1.76 隐藏 v0.1.74 时期的"推荐"措辞老名字（实测 PTR 87.5% 残缺，新版重命名加警告）
+		"日本 Spot 8 核 30G × 8 IP KumoMTA（推荐，n1 73% off）",
+		// v0.1.79 隐藏 v0.1.76 的 Spot 预设（用户反馈刚搭好几分钟就被抢占，太频繁，改 STANDARD 长期跑）
+		"日本 Spot e2-small × 单 NIC × 完美 PTR（推荐量产 48 台）",
+		"日本 Spot 8 核 30G × 8 IP KumoMTA（短期暖机，PTR 仅 nic0 真生效）",
+	}
+	for _, n := range hideOldNames {
+		_, _ = db.Exec(`UPDATE vps_templates SET visible=0 WHERE is_preset=1 AND name=?`, n)
+	}
+
+	// v0.1.79：用户反馈 Spot 抢占太频繁（刚搭好几分钟就被抢占），全量改 STANDARD（不抢占）。
+	//
+	// 单 NIC × 完美 PTR 是主推架构（v0.1.76 起）。STANDARD 价格虽是 Spot 的 6 倍，但稳定性碾压：
+	// 不抢占、不重装、不丢 IP 信誉。3 台 STANDARD 月成本 < 1 台 Spot n1 + 反复抢占的运维痛苦。
+	//
+	// 三档可选：
+	//   - e2-micro    0.25c/1GB  $8.4/月   极省（1 GB RAM 装 caddy 紧张，OOM 风险中等）
+	//   - e2-small    0.5c/2GB   $16.8/月  推荐（KumoMTA + caddy + unsub 全装下没问题）
+	//   - e2-medium   1c/4GB     $33.6/月  从容（量大或部署 48 台时减少抖动）
 	presets := []VPSTemplateDTO{
 		{
-			Name:              "日本主力发信机 KumoMTA（5万/小时）",
-			Regions:           []string{"asia-northeast1", "asia-northeast2"},
-			MachineType:       "e2-standard-2",
-			DiskSizeGB:        20,
-			DiskType:          "pd-ssd",
+			Name:              "日本 e2-small × 单 NIC × 完美 PTR（推荐稳定，$16.8/月/台）",
+			Regions:           []string{"asia-northeast1"},
+			MachineType:       "e2-small",
+			DiskSizeGB:        15,
+			DiskType:          "pd-balanced",
 			DeployType:        "kumomta",
 			ProvisioningModel: "STANDARD",
 			NICCount:          1,
 		},
 		{
-			Name:              "日本高性能发信机 KumoMTA（10万/小时）",
-			Regions:           []string{"asia-northeast1", "asia-northeast2"},
-			MachineType:       "e2-standard-4",
-			DiskSizeGB:        20,
-			DiskType:          "pd-ssd",
+			Name:              "日本 e2-micro × 单 NIC × 完美 PTR（极省，$8.4/月/台，1GB RAM）",
+			Regions:           []string{"asia-northeast1"},
+			MachineType:       "e2-micro",
+			DiskSizeGB:        10,
+			DiskType:          "pd-balanced",
 			DeployType:        "kumomta",
 			ProvisioningModel: "STANDARD",
 			NICCount:          1,
 		},
-		// v0.1.54：3 天即抛业务用 Spot——东京 n1-standard-8 Spot 73% off
-		// 抢占时 30 秒 SIGTERM 预通知 → DELETE 实例（业务模式短期，DELETE 比 STOP 省 IP 持有费）
 		{
-			Name:              "日本 Spot 8 核 KumoMTA（短期批量，73% off）",
+			Name:              "日本 e2-medium × 单 NIC × 完美 PTR（从容，$33.6/月/台，量大用）",
 			Regions:           []string{"asia-northeast1"},
-			MachineType:       "n1-standard-8",
-			DiskSizeGB:        30,
-			DiskType:           "pd-balanced",
-			DeployType:        "kumomta",
-			ProvisioningModel: "SPOT",
-			NICCount:          1, // Batch 1 暂不开多 NIC，下个版本启用
-		},
-		{
-			Name:              "日本 Spot 入门 KumoMTA（最便宜，73% off）",
-			Regions:           []string{"asia-northeast1"},
-			MachineType:       "n1-standard-1",
+			MachineType:       "e2-medium",
 			DiskSizeGB:        20,
 			DiskType:          "pd-balanced",
 			DeployType:        "kumomta",
-			ProvisioningModel: "SPOT",
-			NICCount:          1,
-		},
-		{
-			Name:              "日本收发一体 mailcow（8GB，IMAP/SMTP）",
-			Regions:           []string{"asia-northeast1", "asia-northeast2"},
-			MachineType:       "e2-standard-2",
-			DiskSizeGB:        40, // mailcow + docker + 邮箱存储
-			DiskType:          "pd-ssd",
-			DeployType:        "mailcow",
-			ProvisioningModel: "STANDARD",
-			NICCount:          1,
-		},
-		{
-			Name:              "日本收发一体 mailcow Pro（16GB）",
-			Regions:           []string{"asia-northeast1", "asia-northeast2"},
-			MachineType:       "e2-standard-4",
-			DiskSizeGB:        80,
-			DiskType:          "pd-ssd",
-			DeployType:        "mailcow",
 			ProvisioningModel: "STANDARD",
 			NICCount:          1,
 		},
 	}
 	for _, p := range presets {
+		if p.ProvisioningModel == "" {
+			p.ProvisioningModel = "STANDARD"
+		}
+		if p.NICCount <= 0 {
+			p.NICCount = 1
+		}
 		var existingID string
 		row := db.QueryRow(`SELECT id FROM vps_templates WHERE is_preset=1 AND name=?`, p.Name)
 		if err := row.Scan(&existingID); err == nil && existingID != "" {
+			// v0.1.55: v0.1.54 的预设把 provisioning_model/nic_count 写丢了，启动时同步回来
+			_, _ = db.Exec(`UPDATE vps_templates SET provisioning_model=?, nic_count=? WHERE id=? AND is_preset=1`,
+				p.ProvisioningModel, p.NICCount, existingID)
 			continue
 		}
 		p.ID = uuid.NewString()
@@ -249,12 +257,12 @@ func ensurePresetTemplates() error {
 		regionsJSON, _ := json.Marshal(p.Regions)
 		tagsJSON, _ := json.Marshal([]string{})
 		if _, err := db.Exec(
-			`INSERT INTO vps_templates (id, name, regions_json, auto_spread, machine_type, image_family, image_project, disk_size_gb, disk_type, tags_json, metadata_script, root_password, deploy_type, is_preset)
-             VALUES (?,?,?,1,?,?,?,?,?,?,'','',?,1)`,
-			p.ID, p.Name, string(regionsJSON), p.MachineType, p.ImageFamily, p.ImageProject, p.DiskSizeGB, p.DiskType, string(tagsJSON), p.DeployType); err != nil {
+			`INSERT INTO vps_templates (id, name, regions_json, auto_spread, machine_type, image_family, image_project, disk_size_gb, disk_type, tags_json, metadata_script, root_password, deploy_type, is_preset, provisioning_model, nic_count)
+             VALUES (?,?,?,1,?,?,?,?,?,?,'','',?,1,?,?)`,
+			p.ID, p.Name, string(regionsJSON), p.MachineType, p.ImageFamily, p.ImageProject, p.DiskSizeGB, p.DiskType, string(tagsJSON), p.DeployType, p.ProvisioningModel, p.NICCount); err != nil {
 			return err
 		}
-		logger.Info("初始化预设模板: %s (%s/%s, %dGB %s, type=%s)", p.Name, p.MachineType, p.DiskType, p.DiskSizeGB, p.DiskType, p.DeployType)
+		logger.Info("初始化预设模板: %s (%s/%s, %dGB %s, type=%s, prov=%s, nic=%d)", p.Name, p.MachineType, p.DiskType, p.DiskSizeGB, p.DiskType, p.DeployType, p.ProvisioningModel, p.NICCount)
 	}
 	return nil
 }

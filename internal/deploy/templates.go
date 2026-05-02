@@ -1,13 +1,29 @@
 package deploy
 
 import (
+	"crypto/rand"
+	_ "embed"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
 
+// hexRandom32 生成 32 字节随机数据的 hex 编码（64 字符）
+func hexRandom32() string {
+	var b [32]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 //go:embed templates/*
 var templatesFS embed.FS
+
+// v0.1.74：嵌入预编译的 unsub-server linux/amd64 二进制（~9MB）
+// 部署时 base64 编码后替换 install_unsub.sh 的 {UNSUB_BINARY_B64} 占位符
+//
+//go:embed embed/unsub-server-linux-amd64
+var unsubServerBinary []byte
 
 const (
 	DefaultMailUser     = "info"
@@ -16,35 +32,94 @@ const (
 	DefaultSMTPPort     = 587
 )
 
+// SourceSpec v0.1.57：KumoMTA egress source 单元（多 NIC 模式每个 NIC 一个）。
+// IP 为 KumoMTA bind 的内网 IP；EHLO 是 SMTP HELO 用的主机名（一般 mail{N}.<rootDomain>）。
+type SourceSpec struct {
+	Name string
+	IP   string
+	EHLO string
+}
+
 // DeployVars 模板变量集
 type DeployVars struct {
 	FQDN       string
 	RootDomain string
 	Subdomain  string
 	Selector   string
-	BindIP     string
+	BindIP     string // 主 NIC 内网 IP（多 NIC 模式仍然是 nic0 内网 IP，给单 source 兜底）
 	Username   string
 	Password   string
 
 	HideClientIP bool
+
+	// v0.1.57：渲染好的 KumoMTA Lua 多 source/pool 代码块（init.lua.tmpl {SOURCES_BLOCK}）。
+	// 单 source 时由 BuildDeployVars 自动生成；多 NIC 时调用 BuildSourcesBlock 拼好。
+	SourcesBlock string
+
+	// v0.1.74：退订服务参数。UnsubSecret 由 Stage C 调用方生成（每台 VPS 独立），
+	// 写入数据库 vps_instances.unsub_secret，导出 SMTP 时一并导出给 brutal-mailer。
+	UnsubSecret string
 }
 
-// BuildDeployVars 根据根域名+子域名+绑定 IP 构造模板变量
+// BuildDeployVars 根据根域名+子域名+绑定 IP 构造模板变量（单 NIC 模式或多 NIC 兜底）
 func BuildDeployVars(rootDomain, subdomain, bindIP string) DeployVars {
+	return BuildDeployVarsMultiNIC(rootDomain, subdomain, bindIP, nil)
+}
+
+// BuildDeployVarsMultiNIC v0.1.57：多 NIC 模式下传 sources（每 NIC 一个 SourceSpec）。
+// sources 为空时按单 source 行为生成（用 bindIP + fqdn 自动填）。
+func BuildDeployVarsMultiNIC(rootDomain, subdomain, bindIP string, sources []SourceSpec) DeployVars {
 	subdomain = NormalizeDeploySubdomain(subdomain)
 	fqdn := rootDomain
 	if subdomain != "@" {
 		fqdn = subdomain + "." + rootDomain
 	}
-	return DeployVars{
-		FQDN:       fqdn,
-		RootDomain: rootDomain,
-		Subdomain:  subdomain,
-		Selector:   DefaultSelector,
-		BindIP:     bindIP,
-		Username:   DefaultMailUser + "@" + fqdn,
-		Password:   GenerateMailPassword(rootDomain),
+	if len(sources) == 0 {
+		sources = []SourceSpec{{Name: "primary", IP: bindIP, EHLO: fqdn}}
 	}
+	return DeployVars{
+		FQDN:         fqdn,
+		RootDomain:   rootDomain,
+		Subdomain:    subdomain,
+		Selector:     DefaultSelector,
+		BindIP:       bindIP,
+		Username:     DefaultMailUser + "@" + fqdn,
+		Password:     GenerateMailPassword(rootDomain),
+		SourcesBlock: BuildSourcesBlock(sources),
+	}
+}
+
+// BuildSourcesBlock v0.1.57：拼出 KumoMTA 2026.03+ get_egress_source / get_egress_pool Lua 代码。
+// 单 source 时仍输出标准块（保持 init.lua 行为不变）；多 source 时按 source_name 分发，
+// pool entries 列出全部 source 让 KumoMTA 默认按 weighted=1 随机均等轮换。
+func BuildSourcesBlock(srcs []SourceSpec) string {
+	if len(srcs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if len(srcs) == 1 {
+		s := srcs[0]
+		fmt.Fprintf(&b, "kumo.on('get_egress_source', function(source_name)\n")
+		fmt.Fprintf(&b, "  return kumo.make_egress_source { name=source_name, source_address = '%s', ehlo_domain = '%s' }\nend)\n\n", s.IP, s.EHLO)
+		fmt.Fprintf(&b, "kumo.on('get_egress_pool', function(pool_name)\n")
+		fmt.Fprintf(&b, "  return kumo.make_egress_pool { name=pool_name, entries={ { name='%s' } } }\nend)\n", s.Name)
+		return b.String()
+	}
+	// 多 source：每个 IP 一个 source，pool entries 平均权重轮换
+	b.WriteString("-- v0.1.57 多 NIC：每 IP 一个 egress source，pool 默认 weighted=1 随机均等轮换\n")
+	b.WriteString("kumo.on('get_egress_source', function(source_name)\n")
+	for _, s := range srcs {
+		fmt.Fprintf(&b, "  if source_name == '%s' then return kumo.make_egress_source { name='%s', source_address = '%s', ehlo_domain = '%s' } end\n",
+			s.Name, s.Name, s.IP, s.EHLO)
+	}
+	b.WriteString("  error('unknown egress source: '..source_name)\nend)\n\n")
+	b.WriteString("kumo.on('get_egress_pool', function(pool_name)\n")
+	b.WriteString("  return kumo.make_egress_pool {\n    name = pool_name,\n    entries = {\n")
+	for _, s := range srcs {
+		fmt.Fprintf(&b, "      { name='%s' },\n", s.Name)
+	}
+	b.WriteString("    },\n  }\nend)\n")
+	return b.String()
 }
 
 // GenerateMailPassword 按默认规则生成邮箱密码（{domain} 替换为根域名第一段）
@@ -76,12 +151,53 @@ func render(path string, v DeployVars) (string, error) {
 	}
 	s = strings.ReplaceAll(s, "{TRACE_RECEIVED}", traceHeaders)
 	s = strings.ReplaceAll(s, "{TRACE_SUPPLEMENTAL}", traceHeaders)
+	s = strings.ReplaceAll(s, "{SOURCES_BLOCK}", v.SourcesBlock)
+	// v0.1.74：caddy 需要"裸 FQDN"（不要 mail. 前缀，因为退订用根域 https://<域>/u）
+	s = strings.ReplaceAll(s, "{FQDN_BARE}", v.RootDomain)
+	s = strings.ReplaceAll(s, "{UNSUB_SECRET}", v.UnsubSecret)
 	return s, nil
+}
+
+// RenderInstallUnsub v0.1.74：渲染退订服务安装脚本。
+// v0.1.78：不再 base64 内联二进制（撞 SSH ARG_MAX，5 台同时 EOF）；改由调用方先 ssh.UploadBytes
+// 上传二进制到 /tmp/unsub-server，脚本里 mv 即可。本函数只负责模板替换。
+func RenderInstallUnsub(v DeployVars) (string, error) {
+	if v.UnsubSecret == "" {
+		return "", fmt.Errorf("UnsubSecret 必填")
+	}
+	b, err := templatesFS.ReadFile("templates/install_unsub.sh")
+	if err != nil {
+		return "", fmt.Errorf("读取 install_unsub.sh: %w", err)
+	}
+	s := string(b)
+	s = strings.ReplaceAll(s, "{FQDN}", v.FQDN)
+	s = strings.ReplaceAll(s, "{FQDN_BARE}", v.RootDomain)
+	s = strings.ReplaceAll(s, "{DOMAIN}", v.RootDomain)
+	s = strings.ReplaceAll(s, "{UNSUB_SECRET}", v.UnsubSecret)
+	return s, nil
+}
+
+// UnsubServerBinary v0.1.78：暴露嵌入的 unsub-server 二进制给 stages.go 用 ssh.UploadBytes 上传。
+// 长度 0 时跳过部署退订服务。
+func UnsubServerBinary() []byte { return unsubServerBinary }
+
+// GenerateUnsubSecret v0.1.74：生成 32 字节随机 HMAC 密钥（hex 编码 64 字符）
+func GenerateUnsubSecret() string {
+	return hexRandom32()
 }
 
 // RenderInstallKumoMTA 渲染 KumoMTA 安装脚本
 func RenderInstallKumoMTA(v DeployVars) (string, error) {
 	return render("templates/install_kumomta.sh", v)
+}
+
+// RenderPolicyRouting v0.1.57：渲染多 NIC policy routing 脚本（只换 {NIC_COUNT} 占位符）
+func RenderPolicyRouting(nicCount int) (string, error) {
+	b, err := templatesFS.ReadFile("templates/setup_policy_routing.sh")
+	if err != nil {
+		return "", fmt.Errorf("读取 setup_policy_routing.sh: %w", err)
+	}
+	return strings.ReplaceAll(string(b), "{NIC_COUNT}", fmt.Sprintf("%d", nicCount)), nil
 }
 
 // RenderInstallMailcow 渲染 mailcow 安装脚本（收发一体）
@@ -120,4 +236,3 @@ func boolLua(b bool) string {
 	}
 	return "false"
 }
-

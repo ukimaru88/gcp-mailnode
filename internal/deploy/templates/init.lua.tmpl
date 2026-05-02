@@ -10,8 +10,13 @@
 local kumo = require 'kumo'
 
 kumo.on('init', function()
+  -- v0.1.82：max_segment_duration='5min' 让低流量 VPS 也能定期产出已 close 的可读归档。
+  -- 默认值是无限（max_file_size=1GB 才 roll），低流量场景几天都不 roll，导致软件提取/状态页"扫描 0 个日志"。
+  -- KumoMTA active segment 在 roll/close 前不可读（zstd 流式写入）；只有 close 后的归档能 zstd -dcq。
+  -- 官方文档：https://docs.kumomta.com/reference/kumo/configure_local_logs/max_segment_duration/
   kumo.configure_local_logs {
     log_dir = '/var/log/kumomta',
+    max_segment_duration = '5 minutes',
   }
 
   kumo.define_spool { name = 'data', path = '/var/spool/kumomta/data' }
@@ -48,76 +53,120 @@ kumo.on('init', function()
   -- 如坚持要 465，可在前面加 haproxy/nginx stream SNI terminator，此处不做。
 end)
 
--- KumoMTA 2026.03+ 的 egress source/pool 改用事件回调模式（define_* 函数已废弃）
-kumo.on('get_egress_source', function(source_name)
-  return kumo.make_egress_source {
-    name = source_name,
-    -- GCP VM 网卡本机只有内网 IP；外网静态 IP 是 NAT 映射，不能作为本机 bind 地址。
-    source_address = '{BIND_IP}',
-    ehlo_domain = '{FQDN}',
-  }
-end)
+-- v0.1.57 占位符：单 NIC 时是标准 source/pool；多 NIC 时是 8 source 随机轮换块
+{SOURCES_BLOCK}
 
-kumo.on('get_egress_pool', function(pool_name)
-  return kumo.make_egress_pool {
-    name = pool_name,
-    entries = { { name = 'primary' } },
-  }
-end)
-
--- KumoMTA 2026.03+ requires an egress path config callback; without it,
--- messages can remain scheduled without delivery attempts.
+-- v0.1.84：按 routing_domain 区分 shaping（日本三大手机运营商专项调优 + 其他通用）。
+--
+-- 日本三大手机邮箱硬限制（来自官方文档 + Validity/Warmy 行业共识）：
+--   docomo.ne.jp：3 并发/MX，每连接 ≤100 封；超量直接 421 + 24h IP 黑名单
+--   ezweb.ne.jp / au.com：拥塞直接 TCP RESET（不返 421），邮件 ≤3MB
+--   softbank.ne.jp / i.softbank.jp：i.softbank.jp 邮件 ≤1MB；无公开速率，按 docomo 类似处理
+-- 三家合计理论上限 ~150 封/分钟/服务器。1000 封/分钟/服务器目标必须靠 Gmail/Yahoo.co.jp 等承担余下 850。
+--
+-- 一旦触发 docomo 限制，整个发件 IP 进 24h 黑名单（按 IP 段封不按账号），多 IP 轮换是硬刚需。
 kumo.on('get_egress_path_config', function(routing_domain, egress_source, site_name)
+  -- docomo：最严，3 并发，每分钟 ≤30 封（每连接 100 × 3 conn / 10 倍降速起步）
+  if routing_domain == 'docomo.ne.jp' then
+    return kumo.make_egress_path {
+      enable_tls = 'Opportunistic',
+      connection_limit = 3,
+      max_deliveries_per_connection = 50,
+      max_message_rate = '30/m',
+      max_connection_rate = '5/m',
+      idle_timeout = '30s',
+      max_ready = 50000,
+    }
+  end
+
+  -- au / ezweb：拥塞 TCP RESET，并发稍宽
+  if routing_domain == 'ezweb.ne.jp' or routing_domain == 'au.com' then
+    return kumo.make_egress_path {
+      enable_tls = 'Opportunistic',
+      connection_limit = 5,
+      max_deliveries_per_connection = 50,
+      max_message_rate = '60/m',
+      idle_timeout = '30s',
+      max_ready = 50000,
+    }
+  end
+
+  -- softbank 系（含 i.softbank.jp / vodafone.ne.jp / ymobile.ne.jp）
+  if routing_domain == 'softbank.ne.jp' or routing_domain == 'i.softbank.jp'
+     or routing_domain == 'vodafone.ne.jp' or routing_domain == 'ymobile.ne.jp' then
+    return kumo.make_egress_path {
+      enable_tls = 'Opportunistic',
+      connection_limit = 5,
+      max_deliveries_per_connection = 100,
+      max_message_rate = '60/m',
+      idle_timeout = '30s',
+      max_ready = 50000,
+    }
+  end
+
+  -- 其他域名（Gmail / Yahoo.co.jp / iCloud / 自由域名）：高吞吐通用配置
+  -- 单 IP 10 并发是 Gmail 反垃圾的安全上限；max_message_rate 不限（让 Gmail 自己 throttle）
   return kumo.make_egress_path {
     enable_tls = 'OpportunisticInsecure',
     connection_limit = 10,
-    max_deliveries_per_connection = 100,
+    max_deliveries_per_connection = 1000,
     idle_timeout = '60s',
+    max_ready = 50000,
+    max_message_rate = '20/s',  -- 20 封/秒 ≈ 1200/分钟，覆盖 1000/min 目标
   }
 end)
 
 local auth = require 'smtp_auth'
 kumo.on('smtp_server_auth_plain', auth.check)
 
--- AUTH 通过的会话允许 relay 到任何外部域（Submission 出站发信核心）
--- get_listener_domain 决定 RCPT TO 阶段是否接受投递：返回 {relay_to=true} 即放行。
--- 判断会话已 AUTH 的正确 API：conn_meta:get_meta("authn_id") 返回 string 或 nil。
+-- v0.1.73 黑洞收件：
+-- 25 端口 inbound = AUTH 未通过 → accept_to=true（catch-all 收信）+ relay_to=false（不转发）
+-- 587 端口 submission = AUTH 通过 → relay_to=true（出站发信）
+-- 这样 MX 探测器扫描看到能收信（提升域名信誉），但绝不变成开放中继。
 kumo.on('get_listener_domain', function(domain, listener, conn_meta)
   local authn = conn_meta:get_meta('authn_id')
   if authn and authn ~= '' then
+    -- AUTH 通过：587 出站发信
     return kumo.make_listener_domain { relay_to = true }
   end
-  return kumo.make_listener_domain { relay_to = false }
+  -- 未 AUTH：25 inbound 黑洞，作为任意域的最终目的地接收（accept_to），但不转发（relay_to）
+  return kumo.make_listener_domain { accept_to = true, relay_to = false }
 end)
 
 kumo.on('smtp_server_message_received', function(msg)
+  -- v0.1.73：判断是出站还是 inbound 黑洞
+  local authn = msg:get_meta('authn_id') or ''
+  if authn == '' then
+    -- inbound 黑洞：直接送进 null queue，1 秒过期自动消失，不签 DKIM/ARC（避免给垃圾邮件背书）
+    msg:set_meta('queue', 'null.blackhole')
+    return
+  end
+
+  -- 出站路径（AUTH 通过）：原有 DKIM + ARC 签名逻辑
   -- KumoMTA 作为透明中继：Persona 伪造（Received 链 / UA / X-Mailer）完全在
   -- brutal-mailer 侧完成，这里只负责"屏蔽客户端真实 IP"兜底。
-  --
-  -- 若 HideClientIP 启用，KumoMTA 自己加在 Received 里的客户端 IP 也会被删掉，
-  -- brutal 生成的 Received 链作为唯一 Received 头暴露给接收方。
-  -- KumoMTA 2026.03+ 使用 msg:remove_all_named_headers（旧 remove_header 已废弃）。
-  -- DKIM 签名：只对结构性头签名。User-Agent/X-Mailer 不签名，
-  -- 因为 brutal-mailer 每封信可能使用不同 persona，签名也没有验证价值。
-  -- KumoMTA 2026.03+ 使用 rsa_sha256_signer 两步模式（旧 msg:dkim_sign{...} 已废弃）。
+  -- DKIM 签名：v0.1.74 加 List-Unsubscribe / List-Unsubscribe-Post（Google 一键退订要求这两个头进 DKIM h= 列表）
   local signer = kumo.dkim.rsa_sha256_signer {
     domain = '{DOMAIN}',
     selector = '{SELECTOR}',
-    headers = { 'From', 'To', 'Subject', 'Date', 'Message-ID' },
+    headers = { 'From', 'To', 'Subject', 'Date', 'Message-ID', 'List-Id', 'List-Unsubscribe', 'List-Unsubscribe-Post' },
     key = '/opt/kumomta/etc/keys/{DOMAIN}/{SELECTOR}.key',
   }
   msg:dkim_sign(signer)
 
-  -- ARC seal: 复用同一把 RSA 密钥（DKIM 与 ARC 共用 key 是允许的）。
-  -- authentication_results 传空表 {} —— KumoMTA 是发件 MTA、不是 inbound
-  -- 验证站，ARC chain 从我们这里开始（i=1），上游无验证记录可继承。
-  -- server_id 用 FQDN，会出现在 ARC-Authentication-Results 头里作为
-  -- authserv-id。必须在 dkim_sign 之后调用，因为 ARC 要 seal 包含 DKIM
-  -- 头在内的最终消息状态。
+  -- ARC seal: 复用同一把 RSA 密钥
   msg:arc_seal(signer, '{FQDN}', {})
 end)
 
 kumo.on('get_queue_config', function(domain, tenant, campaign)
+  if domain == 'null.blackhole' then
+    -- 黑洞 queue：1 秒过期，不重试，不投递
+    return kumo.make_queue_config {
+      max_age = '1s',
+      retry_interval = '1s',
+      max_retry_interval = '1s',
+    }
+  end
   return kumo.make_queue_config {
     egress_pool = 'default',
   }

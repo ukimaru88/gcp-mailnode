@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,8 +69,21 @@ func (a *App) GetExtractOutputDir() (string, error) {
 // 全部 VPS 完成后：跨 VPS 合并去重 → WriteCategorized 按域名分类写 txt
 // 输出到 ~/Desktop/邮箱提取结果/。
 //
+// 语义：parser 只把 'Delivery' 事件（成功投递到远端 MX 的 250 OK）的 Recipient 加入导出，
+// 'Reception' / 'Bounce' / 'TransientFailure' 不导出。所以输出文件里全是发送成功的邮箱。
+//
 // 仅支持 deploy_type='kumomta' 的 VPS；mailcow 节点会在 Result.Error 里标注跳过。
+//
+// v0.1.77：本入口默认不删服务器日志（向后兼容旧调用方）；
+// 自动调度走 ExtractFromVPSWithDelete（deleteAfter=true）。
 func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
+	return a.ExtractFromVPSWithDelete(vpsIDs, false)
+}
+
+// ExtractFromVPSWithDelete 同 ExtractFromVPS，但 deleteAfter=true 时提取成功后调用 DeleteKumoMTALogsBefore
+// 删除服务器上 ≤ cursor 的所有日志（包括成功+失败的，已读到本地的就不再保留）。
+// 安全：只在写本地文件成功后才删；当台 VPS SSH 失败 / 解析失败 / 写文件失败时不删，下次还能重读。
+func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (ExtractSummary, error) {
 	ctx := a.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -113,6 +127,13 @@ func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
 	sem := make(chan struct{}, concurrency)
 	results := make([]ExtractResult, len(rows))
 	allEmails := make([]string, 0, 4096)
+	// 提取成功的 (vpsID, sshCfg, cursor) 列表，写本地文件成功后用来批量删服务器日志
+	type cleanupEntry struct {
+		vpsID, name string
+		cfg         ssh.Config
+		cursor      string
+	}
+	cleanupList := make([]cleanupEntry, 0, len(rows))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -143,7 +164,7 @@ func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
 				Username:   "root",
 				KeyContent: string(sshkey.PrivatePEM()),
 			}
-			content, _, err := ssh.ReadKumoMTALogs(ctx, cfg, "/var/log/kumomta/", "")
+			content, cursor, err := ssh.ReadKumoMTALogs(ctx, cfg, "/var/log/kumomta/", "")
 			if err != nil {
 				res.Error = err.Error()
 				results[i] = res
@@ -158,11 +179,14 @@ func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
 
 			mu.Lock()
 			allEmails = append(allEmails, pr.Emails...)
+			if deleteAfter && cursor != "" {
+				cleanupList = append(cleanupList, cleanupEntry{vpsID: v.id, name: v.name, cfg: cfg, cursor: cursor})
+			}
 			mu.Unlock()
 
 			results[i] = res
-			logger.Info("[extract %s] %s lines=%d parsed=%d emails=%d",
-				batchID, v.name, res.Lines, res.Parsed, res.Emails)
+			logger.Info("[extract %s] %s lines=%d parsed=%d emails=%d cursor=%s",
+				batchID, v.name, res.Lines, res.Parsed, res.Emails, cursor)
 		}()
 	}
 	wg.Wait()
@@ -179,10 +203,12 @@ func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
 		OutputDir:   outputDir,
 		TotalEmails: len(uniq),
 	}
+	writeOK := true
 	if len(uniq) > 0 {
 		w := &export.Writer{OutputDir: outputDir, LinesPerFile: 50000}
 		wr, werr := w.WriteCategorized(uniq)
 		if werr != nil {
+			writeOK = false
 			return summary, fmt.Errorf("写文件失败: %w", werr)
 		}
 		summary.WriteResult = WriteSummary{
@@ -193,6 +219,29 @@ func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
 		}
 	}
 	logger.Info("[extract %s] 完成：跨 VPS 唯一邮箱 %d → %s", batchID, len(uniq), outputDir)
+
+	// v0.1.77：deleteAfter=true 且写文件成功后，批量删除服务器上 ≤ cursor 的日志（成功+失败一起删）
+	// 安全：只删提取成功的 VPS（在 cleanupList 里）；任何 VPS 失败时不影响其他成功的删除
+	if deleteAfter && writeOK && len(cleanupList) > 0 {
+		var delWG sync.WaitGroup
+		delSem := make(chan struct{}, concurrency)
+		for _, ent := range cleanupList {
+			ent := ent
+			delWG.Add(1)
+			delSem <- struct{}{}
+			go func() {
+				defer delWG.Done()
+				defer func() { <-delSem }()
+				n, err := ssh.DeleteKumoMTALogsBefore(ctx, ent.cfg, "/var/log/kumomta/", ent.cursor)
+				if err != nil {
+					logger.Warn("[extract %s] %s 删服务器日志失败（不影响下次提取，最多多读一次）: %v", batchID, ent.name, err)
+				} else {
+					logger.Info("[extract %s] %s 已删服务器日志 %d 个文件（≤ %s）", batchID, ent.name, n, ent.cursor)
+				}
+			}()
+		}
+		delWG.Wait()
+	}
 	return summary, nil
 }
 
@@ -216,3 +265,182 @@ func dedupEmails(in []string) []string {
 
 // 占位避免未使用 time 时 Go 报错（如果未来加超时控制）
 var _ = time.Second
+
+// ============================================================================
+// v0.1.77：自动提取调度器
+// ============================================================================
+
+// ExtractScheduleConfig 自动提取配置（前后端共享 DTO）
+type ExtractScheduleConfig struct {
+	Enabled       bool   `json:"enabled"`         // 总开关
+	IntervalMin   int    `json:"interval_min"`    // 间隔分钟（最小 1，建议 ≥5 避免过频 SSH）
+	DeleteAfter   bool   `json:"delete_after"`    // 提取完是否删服务器日志（默认 true，与需求一致）
+	LastRunAt     string `json:"last_run_at"`     // 上次跑的时间（ISO8601）
+	LastRunStatus string `json:"last_run_status"` // ok / error
+	LastRunMsg    string `json:"last_run_msg"`    // 上次结果摘要
+	NextRunAt     string `json:"next_run_at"`     // 下次预定时间
+}
+
+const (
+	settingExtractSchedule = "extract_schedule_config"
+)
+
+var (
+	scheduleMu      sync.Mutex
+	scheduleStarted bool
+)
+
+// GetExtractSchedule 返回当前自动提取配置（settings 表 key=extract_schedule_config）
+func (a *App) GetExtractSchedule() (ExtractScheduleConfig, error) {
+	cfg := ExtractScheduleConfig{Enabled: false, IntervalMin: 15, DeleteAfter: true}
+	db, err := requireDB()
+	if err != nil {
+		return cfg, err
+	}
+	var raw string
+	row := db.QueryRow(`SELECT value FROM settings WHERE key=?`, settingExtractSchedule)
+	if err := row.Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return cfg, nil // 默认值
+		}
+		return cfg, err
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		logger.Warn("解析 extract_schedule_config 失败，回默认值: %v", err)
+		return ExtractScheduleConfig{Enabled: false, IntervalMin: 15, DeleteAfter: true}, nil
+	}
+	if cfg.IntervalMin < 1 {
+		cfg.IntervalMin = 15
+	}
+	return cfg, nil
+}
+
+// SetExtractSchedule 写入自动提取配置（前端开关 / 修改间隔 时调用）
+func (a *App) SetExtractSchedule(cfg ExtractScheduleConfig) error {
+	if cfg.IntervalMin < 1 {
+		cfg.IntervalMin = 15
+	}
+	if cfg.IntervalMin > 1440 {
+		cfg.IntervalMin = 1440 // 一天最多间隔
+	}
+	db, err := requireDB()
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO settings (key, value) VALUES (?,?)
+	                  ON CONFLICT(key) DO UPDATE SET value=excluded.value`, settingExtractSchedule, string(raw))
+	if err != nil {
+		return err
+	}
+	logger.Info("自动提取配置已更新: enabled=%v interval=%dmin deleteAfter=%v", cfg.Enabled, cfg.IntervalMin, cfg.DeleteAfter)
+	return nil
+}
+
+// startExtractScheduler 启动后台调度 goroutine（App.startup 调用一次）
+// 每 30 秒 tick 一次，检查是否到点；到点则跑全部 KumoMTA VPS 的提取（deleteAfter=配置值）
+func (a *App) startExtractScheduler() {
+	scheduleMu.Lock()
+	if scheduleStarted {
+		scheduleMu.Unlock()
+		return
+	}
+	scheduleStarted = true
+	scheduleMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		logger.Info("自动提取调度器启动（30s tick，按 settings.extract_schedule_config 决定是否执行）")
+		for {
+			select {
+			case <-a.ctx.Done():
+				logger.Info("自动提取调度器退出（ctx done）")
+				return
+			case <-ticker.C:
+				a.tickExtractSchedule()
+			}
+		}
+	}()
+}
+
+// tickExtractSchedule 每 tick 检查一次是否到点
+func (a *App) tickExtractSchedule() {
+	cfg, err := a.GetExtractSchedule()
+	if err != nil || !cfg.Enabled {
+		return
+	}
+	// 计算"上次运行 + interval"是否 ≤ 现在
+	now := time.Now()
+	if cfg.LastRunAt != "" {
+		if last, err := time.Parse(time.RFC3339, cfg.LastRunAt); err == nil {
+			if now.Sub(last) < time.Duration(cfg.IntervalMin)*time.Minute {
+				return // 还没到下次时间
+			}
+		}
+	}
+	// 到点：跑提取
+	a.runScheduledExtract(cfg)
+}
+
+// runScheduledExtract 执行一次自动提取（拉所有 KumoMTA VPS）
+func (a *App) runScheduledExtract(cfg ExtractScheduleConfig) {
+	startedAt := time.Now()
+	logger.Info("自动提取触发：interval=%dmin deleteAfter=%v", cfg.IntervalMin, cfg.DeleteAfter)
+
+	// 标记本次开始（即使失败也写，否则失败时会狂跑）
+	cfg.LastRunAt = startedAt.UTC().Format(time.RFC3339)
+	cfg.NextRunAt = startedAt.Add(time.Duration(cfg.IntervalMin) * time.Minute).UTC().Format(time.RFC3339)
+
+	db, err := requireDB()
+	if err != nil {
+		cfg.LastRunStatus = "error"
+		cfg.LastRunMsg = "DB 未就绪: " + err.Error()
+		_ = a.SetExtractSchedule(cfg)
+		return
+	}
+
+	// 拉所有可提取的 KumoMTA VPS（deploy_type=kumomta + deploy_status 在 success/mta_ready/ptr_ready + status!=deleted + 有 IP）
+	rows, err := db.Query(`SELECT id FROM vps_instances
+	                       WHERE COALESCE(deploy_type,'kumomta')='kumomta'
+	                         AND COALESCE(status,'') != 'deleted'
+	                         AND COALESCE(ip,'') != ''
+	                         AND COALESCE(deploy_status,'') IN ('success','mta_ready','ptr_ready')`)
+	if err != nil {
+		cfg.LastRunStatus = "error"
+		cfg.LastRunMsg = "查询 VPS 失败: " + err.Error()
+		_ = a.SetExtractSchedule(cfg)
+		return
+	}
+	var vpsIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			vpsIDs = append(vpsIDs, id)
+		}
+	}
+	rows.Close()
+
+	if len(vpsIDs) == 0 {
+		cfg.LastRunStatus = "ok"
+		cfg.LastRunMsg = "无可提取 VPS，跳过"
+		_ = a.SetExtractSchedule(cfg)
+		return
+	}
+
+	summary, err := a.ExtractFromVPSWithDelete(vpsIDs, cfg.DeleteAfter)
+	if err != nil {
+		cfg.LastRunStatus = "error"
+		cfg.LastRunMsg = fmt.Sprintf("提取失败 (vps=%d): %v", len(vpsIDs), err)
+	} else {
+		cfg.LastRunStatus = "ok"
+		cfg.LastRunMsg = fmt.Sprintf("提取 %d 台 VPS，新邮箱 %d / 总 %d，用时 %s",
+			len(vpsIDs), summary.WriteResult.NewEmails, summary.TotalEmails, time.Since(startedAt).Truncate(time.Second))
+	}
+	_ = a.SetExtractSchedule(cfg)
+	logger.Info("自动提取完成: %s", cfg.LastRunMsg)
+}
+

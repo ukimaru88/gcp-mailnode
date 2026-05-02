@@ -193,15 +193,25 @@ func ReadMailLogFull(ctx context.Context, cfg Config, logPath string) (string, i
 	return content, size, nil
 }
 
-// ReadKumoMTALogs 读取远程 KumoMTA 滚动日志目录 /var/log/kumomta/
-// 文件名是时间戳格式（20260424-102217.707271999），按文件名字典序升序
-// 只读比 lastFile 更新的文件（lastFile == "" 时全读）
-// 返回：
-//   - 拼接后的明文日志（每个 zstd 文件解压后内容按时间顺序拼接）
-//   - 新游标（最大文件名的前一个；最新那个可能还在写，下次要重读）
-//   - 错误
+// ReadKumoMTALogs 读取远程 KumoMTA 已归档（已 close）的日志文件。
 //
-// 远端依赖 zstd 命令（KumoMTA 安装时已 apt 装）。本地 Go 不解压。
+// v0.1.82 重要修正（推翻 v0.1.80/v0.1.81 的"cat active 明文"误判）：
+//
+// 官方文档：https://docs.kumomta.com/reference/kumo/configure_local_logs/
+//   - active segment 是 zstd 流式压缩文件，**roll/close 之前完全不可读**
+//   - 直接 cat active 文件会读到二进制乱码，喂给 JSON parser 当然 0 条
+//   - 看 active 唯一办法：远端 `/opt/kumomta/sbin/tailer --tail /var/log/kumomta`
+//   - 默认 max_segment_duration 无限，max_file_size=1GB 才 roll → 低流量 VPS 几天都不 roll
+//
+// v0.1.82 双管齐下：
+//   1. init.lua 加 max_segment_duration='5 minutes'，让 KumoMTA 每 5 分钟自动 roll 一次
+//      → 软件这边最多延迟 5 分钟能看到数据
+//   2. 这里只读"非 active"的已归档文件（active 是字典序最大的那个，跳过它）
+//      所有归档文件无论后缀都用 zstd -dcq 解压（KumoMTA 全程 zstd 压缩，不存在明文）
+//
+// 返回：
+//   - 解压后的明文 JSON（已归档的全部内容）
+//   - cursor = 当前 active 文件名（DeleteKumoMTALogsBefore 用 < 比较，永远不会删 active）
 func ReadKumoMTALogs(ctx context.Context, cfg Config, logDir string, lastFile string) (string, string, error) {
 	if logDir == "" {
 		logDir = "/var/log/kumomta/"
@@ -209,24 +219,27 @@ func ReadKumoMTALogs(ctx context.Context, cfg Config, logDir string, lastFile st
 	dir := strings.TrimRight(logDir, "/")
 	escDir := strings.ReplaceAll(dir, "'", "'\\''")
 
-	// 远端 zstd 可用性预检：缺 zstd 时显式报错（避免"提取成功 0 条"误导）
+	// 远端 zstd 可用性预检
 	if out, _ := RunCommand(ctx, cfg, "command -v zstd >/dev/null 2>&1 && echo ok || echo missing"); strings.Contains(out, "missing") {
 		return "", lastFile, fmt.Errorf("远端缺少 zstd：apt-get install -y zstd")
 	}
 
-	// 列出所有日志文件（按名字升序，跳过 lastFile 及之前的），解压后拼接输出
+	// v0.1.82：只解压"非 active"的已归档文件
+	// active = ls 字典序最大的那个（KumoMTA 还在写）；前面所有文件都已 close，可以 zstd -dcq
+	// 文件无后缀（KumoMTA 默认）或带 .zst（某些版本），统一用 zstd 解压
 	cmd := fmt.Sprintf(
-		`cd '%s' && ls -1 | sort | awk -v last='%s' 'last=="" || $0>last' | while read f; do zstd -dcq "$f" 2>/dev/null || true; done`,
+		`cd '%s' && ls -1 | sort | head -n -1 | while read f; do zstd -dcq "$f" 2>/dev/null || true; done`,
 		escDir,
-		strings.ReplaceAll(lastFile, "'", "'\\''"),
 	)
 	content, err := RunCommand(ctx, cfg, cmd)
 	if err != nil {
 		return "", lastFile, fmt.Errorf("读取 KumoMTA 日志目录失败: %w", err)
 	}
 
-	// 取当前目录下最大文件名的前一个作为游标（最新那个还在写）
-	cursorCmd := fmt.Sprintf(`cd '%s' && ls -1 | sort | tail -n 2 | head -n 1`, escDir)
+	// cursor = active 文件名本身（DeleteKumoMTALogsBefore 永远不会删它，因为它用的是 <= cursor 比较）
+	// 但等等 — DeleteKumoMTALogsBefore 用 <= 会把 cursor 自己也删了。所以 cursor 取倒数第二（最后归档的）
+	// 这样 DeleteKumoMTALogsBefore 删 ≤ 倒数第二的全部归档，active 文件不动。
+	cursorCmd := fmt.Sprintf(`cd '%s' && cnt=$(ls -1 | wc -l); if [ $cnt -ge 2 ]; then ls -1 | sort | tail -n 2 | head -n 1; fi`, escDir)
 	cursor, _ := RunCommand(ctx, cfg, cursorCmd)
 	newLastFile := strings.TrimSpace(cursor)
 	if newLastFile == "" {
@@ -234,6 +247,38 @@ func ReadKumoMTALogs(ctx context.Context, cfg Config, logDir string, lastFile st
 	}
 
 	return content, newLastFile, nil
+}
+
+// DeleteKumoMTALogsBefore 删除 ≤ cursor 的所有 KumoMTA 日志文件（保留 cursor 之后及当前正在写的最新文件）。
+// cursor 为 ReadKumoMTALogs 返回的"最大文件名的前一个"游标，上一次成功读取并解析的最后文件名。
+// cursor=="" 时为安全起见不删任何文件（防止误删未提取的数据）。
+//
+// v0.1.77：用户场景"提取完自动删服务器数据"。一次提取的语义：
+//  1. ReadKumoMTALogs 拿到 [起始, cursor] 之间的全部日志内容
+//  2. 解析、写本地、确认成功
+//  3. 调用此函数删除 [起始, cursor] 区间，保留 (cursor, 现在] 让下次再读
+func DeleteKumoMTALogsBefore(ctx context.Context, cfg Config, logDir string, cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil // 安全：无游标时不删
+	}
+	if logDir == "" {
+		logDir = "/var/log/kumomta/"
+	}
+	dir := strings.TrimRight(logDir, "/")
+	escDir := strings.ReplaceAll(dir, "'", "'\\''")
+	escCursor := strings.ReplaceAll(cursor, "'", "'\\''")
+	// 删除文件名 <= cursor 的所有日志（包括 cursor 本身），打印删除数
+	cmd := fmt.Sprintf(
+		`cd '%s' && deleted=0; for f in $(ls -1 | sort | awk -v last='%s' '$0<=last'); do rm -f "$f" && deleted=$((deleted+1)); done; echo $deleted`,
+		escDir, escCursor,
+	)
+	out, err := RunCommand(ctx, cfg, cmd)
+	if err != nil {
+		return 0, fmt.Errorf("删除 KumoMTA 日志失败: %w", err)
+	}
+	var n int
+	fmt.Sscanf(strings.TrimSpace(out), "%d", &n)
+	return n, nil
 }
 
 // GetFileSize 获取远程文件大小
@@ -325,6 +370,72 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 // parsePrivateKey 解析 PEM 私钥（不带密码保护）
 func parsePrivateKey(pemBytes []byte) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey(pemBytes)
+}
+
+// UploadBytes v0.1.78：把任意字节内容（含二进制）通过 SSH stdin 上传到远端文件。
+// 用 `cat > path` 接收 stdin 流，避免 `echo BASE64 | base64 -d | bash` 走单一 command
+// 撞 ARG_MAX (2MB) / OpenSSH command 长度上限的问题。
+// 适合大二进制文件（unsub-server 9.8MB 等），实测 50MB 内稳定。
+func UploadBytes(ctx context.Context, cfg Config, remotePath string, data []byte) error {
+	client, err := connect(cfg, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("SSH 连接失败: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("创建会话失败: %w", err)
+	}
+	defer session.Close()
+
+	// 转义远端路径里的单引号（极少见但兜底）
+	escPath := strings.ReplaceAll(remotePath, "'", "'\\''")
+	// 用 dd 收 stdin → 文件；mkdir -p 父目录避免路径不存在
+	parent := remotePath
+	if i := strings.LastIndex(parent, "/"); i > 0 {
+		parent = parent[:i]
+	} else {
+		parent = "."
+	}
+	escParent := strings.ReplaceAll(parent, "'", "'\\''")
+	cmd := fmt.Sprintf(`mkdir -p '%s' && cat > '%s' && chmod 644 '%s'`, escParent, escPath, escPath)
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("打开 stdin pipe 失败: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	session.Stderr = &stderrBuf
+
+	if err := session.Start(cmd); err != nil {
+		return fmt.Errorf("启动远端 cat 失败: %w", err)
+	}
+
+	// 流式写入数据（go-ssh 的 StdinPipe 内部分块发，无需手动切）
+	writeDone := make(chan error, 1)
+	go func() {
+		_, werr := stdin.Write(data)
+		stdin.Close()
+		writeDone <- werr
+	}()
+
+	// 等待写完或 ctx 取消
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGTERM)
+		return ctx.Err()
+	case werr := <-writeDone:
+		if werr != nil {
+			return fmt.Errorf("写入 stdin 失败: %w (stderr: %s)", werr, strings.TrimSpace(stderrBuf.String()))
+		}
+	}
+
+	// 等远端 cat 结束
+	if err := session.Wait(); err != nil {
+		return fmt.Errorf("远端 cat 失败: %w (stderr: %s)", err, strings.TrimSpace(stderrBuf.String()))
+	}
+	return nil
 }
 
 // RunScript 通过 base64 管道将脚本发送到远程执行，实时回调输出
