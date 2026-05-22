@@ -26,8 +26,9 @@ var templatesFS embed.FS
 var unsubServerBinary []byte
 
 const (
-	DefaultMailUser     = "info"
-	DefaultMailPassword = "KIOuyse21@"
+	DefaultMailUser = "info"
+	// 邮箱密码默认留空，不硬编码（由使用者运行时填写）
+	DefaultMailPassword = ""
 	DefaultSelector     = "default"
 	DefaultSMTPPort     = 587
 )
