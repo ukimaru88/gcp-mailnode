@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -206,6 +207,17 @@ func validateDeployDomains(v DeployVars) error {
 	return nil
 }
 
+// shellVarRE 匹配所有 bash/sh 风格的变量引用 ${VAR} 和 ${VAR%xxx} ${VAR:-xxx} 等。
+// render 替换 Go 占位符 {FQDN}/{DOMAIN}/... 前先把这些"shell ${...}"用 sentinel 替换出去，
+// 避免 strings.ReplaceAll("{FQDN}", ...) 误把 ${FQDN} 中的 {FQDN} 子串也替换掉。
+//
+// v0.2.13：修一个从 v0.2.3（Postfix 路径引入 ${FQDN} ${DOMAIN} 等 shell 变量时）就存在的
+// 致命渲染 bug：install_postfix.sh line 200 `echo "${FQDN}" > /etc/hostname` 会被渲染成
+// `echo "$madouchuanm.com" > /etc/hostname` —— bash 把 $madouchuanm 当未定义变量展开成空串，
+// 结果 /etc/hostname 写入 ".com"，进而 main.cf 的 myhostname=.com，postfix master fatal exit。
+// 之前的 v0.2.11 sanity check 拦住了部署但没修根因；本版从源头修复。
+var shellVarRE = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*(?:[%#:][^}]*)?\}`)
+
 // render 读取嵌入模板并按 DeployVars 字段替换占位符
 func render(path string, v DeployVars) (string, error) {
 	if err := validateDeployDomains(v); err != nil {
@@ -216,6 +228,17 @@ func render(path string, v DeployVars) (string, error) {
 		return "", fmt.Errorf("读取 %s 失败: %w", path, err)
 	}
 	s := string(b)
+
+	// 阶段 1：把所有 shell ${VAR}/${VAR%xx} 等用唯一 sentinel 替换出去，保护它们不被
+	// strings.ReplaceAll 误伤。sentinel 用 \x00 包围，原始模板里不可能出现。
+	shellRefs := shellVarRE.FindAllString(s, -1)
+	const sentinelPrefix = "\x00GMSHELL\x00"
+	for i, ref := range shellRefs {
+		s = strings.Replace(s, ref, fmt.Sprintf("%s%d\x00", sentinelPrefix, i), 1)
+	}
+
+	// 阶段 2：替换 Go 占位符（注意先长后短：{FQDN_BARE} 必须在 {FQDN} 之前，否则前者残留 "_BARE}"）
+	s = strings.ReplaceAll(s, "{FQDN_BARE}", v.RootDomain)
 	s = strings.ReplaceAll(s, "{FQDN}", v.FQDN)
 	s = strings.ReplaceAll(s, "{DOMAIN}", v.RootDomain)
 	s = strings.ReplaceAll(s, "{SELECTOR}", v.Selector)
@@ -230,9 +253,12 @@ func render(path string, v DeployVars) (string, error) {
 	s = strings.ReplaceAll(s, "{TRACE_RECEIVED}", traceHeaders)
 	s = strings.ReplaceAll(s, "{TRACE_SUPPLEMENTAL}", traceHeaders)
 	s = strings.ReplaceAll(s, "{SOURCES_BLOCK}", v.SourcesBlock)
-	// v0.1.74：caddy 需要"裸 FQDN"（不要 mail. 前缀，因为退订用根域 https://<域>/u）
-	s = strings.ReplaceAll(s, "{FQDN_BARE}", v.RootDomain)
 	s = strings.ReplaceAll(s, "{UNSUB_SECRET}", v.UnsubSecret)
+
+	// 阶段 3：恢复 shell ${VAR} 引用
+	for i, ref := range shellRefs {
+		s = strings.Replace(s, fmt.Sprintf("%s%d\x00", sentinelPrefix, i), ref, 1)
+	}
 	return s, nil
 }
 

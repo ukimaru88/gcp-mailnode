@@ -127,6 +127,31 @@ func TestRenderSmtpAuthLua_NoEmptyPassword(t *testing.T) {
 	}
 }
 
+// TestRender_PreservesShellVarRefs 锁死 v0.2.13 修复：模板里的 ${FQDN} ${DOMAIN} ${USER%@*}
+// 等 shell 变量引用必须原样保留，不能被 strings.ReplaceAll("{FQDN}", ...) 误伤。
+// 之前的 bug：${FQDN} 中的 {FQDN} 子串被替换 → 渲染出 $madouchuanm.com → bash 把
+// $madouchuanm 当未定义变量展开成空 → 实际值变成 ".com" → /etc/hostname=.com →
+// myhostname=.com → postfix master fatal exit。
+func TestRender_PreservesShellVarRefs(t *testing.T) {
+	v := BuildDeployVars("example.com", "@", "10.0.0.1")
+	out, err := RenderInstallPostfix(v)
+	if err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	// 关键 shell 引用必须原样保留
+	for _, ref := range []string{"${FQDN}", "${DOMAIN}", "${SERVER_IP}", `${SASL_USER_FULL}`, `${SASL_USER_FULL%@*}`} {
+		if !strings.Contains(out, ref) {
+			t.Errorf("shell 变量引用 %s 被 render 破坏（应原样保留）", ref)
+		}
+	}
+	// 关键：不允许出现把域名前缀拼到 $ 后面的破坏形态（"$example" 或 "$example.com"）
+	for _, broken := range []string{"$example.com", "$example ", `"$example"`} {
+		if strings.Contains(out, broken) {
+			t.Errorf("渲染输出含破坏形态 %q（${FQDN} 被误替换）:\n%s", broken, out)
+		}
+	}
+}
+
 // TestRender_RejectsInjectionDomain 锁死域名注入防线：含 shell/Lua 危险字符的域名
 // 必须在渲染时被拒（render 单点校验），合法 LDH 域名正常通过。
 func TestRender_RejectsInjectionDomain(t *testing.T) {
