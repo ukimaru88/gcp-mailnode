@@ -185,6 +185,10 @@ func ensurePresetTemplates() error {
 		// v0.1.79 隐藏 v0.1.76 的 Spot 预设（用户反馈刚搭好几分钟就被抢占，太频繁，改 STANDARD 长期跑）
 		"日本 Spot e2-small × 单 NIC × 完美 PTR（推荐量产 48 台）",
 		"日本 Spot 8 核 30G × 8 IP KumoMTA（短期暖机，PTR 仅 nic0 真生效）",
+		// v0.2.8：用户决定预设统一只保留 e2-micro，软隐藏旧的 e2-micro(极省旧名)/e2-small/e2-medium 三个预设
+		"日本 e2-micro × 单 NIC × 完美 PTR（极省，$8.4/月/台，1GB RAM）",
+		"日本 e2-small × 单 NIC × 完美 PTR（推荐稳定，$16.8/月/台）",
+		"日本 e2-medium × 单 NIC × 完美 PTR（从容，$33.6/月/台，量大用）",
 	}
 	for _, n := range hideOldNames {
 		_, _ = db.Exec(`UPDATE vps_templates SET visible=0 WHERE is_preset=1 AND name=?`, n)
@@ -193,38 +197,17 @@ func ensurePresetTemplates() error {
 	// v0.1.79：用户反馈 Spot 抢占太频繁（刚搭好几分钟就被抢占），全量改 STANDARD（不抢占）。
 	//
 	// 单 NIC × 完美 PTR 是主推架构（v0.1.76 起）。STANDARD 价格虽是 Spot 的 6 倍，但稳定性碾压：
-	// 不抢占、不重装、不丢 IP 信誉。3 台 STANDARD 月成本 < 1 台 Spot n1 + 反复抢占的运维痛苦。
+	// 不抢占、不重装、不丢 IP 信誉。
 	//
-	// 三档可选：
-	//   - e2-micro    0.25c/1GB  $8.4/月   极省（1 GB RAM 装 caddy 紧张，OOM 风险中等）
-	//   - e2-small    0.5c/2GB   $16.8/月  推荐（KumoMTA + caddy + unsub 全装下没问题）
-	//   - e2-medium   1c/4GB     $33.6/月  从容（量大或部署 48 台时减少抖动）
+	// v0.2.8：用户决定预设统一只保留 e2-micro（删掉 e2-small/e2-medium 预设，旧名已在上方
+	// hideOldNames 软隐藏）。仍可在 UI 手动新建其它机型的模板，新建模板的默认机型也是 e2-micro。
+	//   - e2-micro  0.25c/1GB  $8.4/月  默认（KumoMTA 单 NIC 够用；同装 caddy/unsub 注意 RAM）
 	presets := []VPSTemplateDTO{
 		{
-			Name:              "日本 e2-small × 单 NIC × 完美 PTR（推荐稳定，$16.8/月/台）",
-			Regions:           []string{"asia-northeast1"},
-			MachineType:       "e2-small",
-			DiskSizeGB:        15,
-			DiskType:          "pd-balanced",
-			DeployType:        "kumomta",
-			ProvisioningModel: "STANDARD",
-			NICCount:          1,
-		},
-		{
-			Name:              "日本 e2-micro × 单 NIC × 完美 PTR（极省，$8.4/月/台，1GB RAM）",
+			Name:              "日本 e2-micro × 单 NIC × 完美 PTR（默认，$8.4/月/台）",
 			Regions:           []string{"asia-northeast1"},
 			MachineType:       "e2-micro",
 			DiskSizeGB:        10,
-			DiskType:          "pd-balanced",
-			DeployType:        "kumomta",
-			ProvisioningModel: "STANDARD",
-			NICCount:          1,
-		},
-		{
-			Name:              "日本 e2-medium × 单 NIC × 完美 PTR（从容，$33.6/月/台，量大用）",
-			Regions:           []string{"asia-northeast1"},
-			MachineType:       "e2-medium",
-			DiskSizeGB:        20,
 			DiskType:          "pd-balanced",
 			DeployType:        "kumomta",
 			ProvisioningModel: "STANDARD",

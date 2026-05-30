@@ -88,7 +88,7 @@ D:\gcp-mailnode\
 ### v0.2.0 关键削减
 - **删 KumoMTA 限速**（日本三大 shaping + 1200/min 全删）→ 用户希望纯透明中继不限速
 - 改 **STANDARD 非 Spot**（Spot 实例会被抢占影响发信）
-- 三档机型：e2-micro（最小）/ e2-small（默认）/ e2-medium
+- 机型：代码支持 e2-micro/small/medium 等多档手动选；**v0.2.8 起开机预设只留 e2-micro，新建模板默认也是 e2-micro**（原 v0.2.0 的 small/medium 预设已删 + 旧预设软隐藏）
 
 ### 邮箱默认密码
 - `templates.go` 的 `DefaultMailPassword` **已去硬编码**（为空），部署时必须传参
@@ -147,7 +147,7 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.8**（待打包） | 最新。安全 + 正确性修复：① **P0 开放中继**（`GenerateMailPassword` 空时回退随机 20 位 [A-Za-z0-9] 密码）② **域名注入**（`render()` 单点 LDH 白名单校验，堵 shell+Lua）③ **配额自愈失效**（`IsQuotaExceeded` 改 `contains(quota)&&contains(exceeded)`，识别 GCP 真实配额 message）④ **OAuth 无超时**（`cfg.Exchange` 改用 timeoutCtx）⑤ 修审计 P1-1 失效测试断言。全部加防回归测试 |
+| **v0.2.8**（待打包） | 最新。安全 + 正确性修复：① **P0 开放中继**（`GenerateMailPassword` 空时回退随机 20 位 [A-Za-z0-9] 密码）② **域名注入**（`render()` 单点 LDH 白名单校验，堵 shell+Lua）③ **配额自愈失效**（`IsQuotaExceeded` 改 `contains(quota)&&contains(exceeded)`，识别 GCP 真实配额 message）④ **OAuth 无超时**（`cfg.Exchange` 改用 timeoutCtx）⑤ 修审计 P1-1 失效测试断言（全部加防回归测试）⑥ **预设模板统一只留 e2-micro**：删 e2-small/e2-medium 预设、软隐藏旧预设；新建模板默认机型仍 e2-micro，前端下拉保留多档供手动选 |
 | v0.2.7 | SMTP 导出格式全栈对齐 mail-toolkit 约定：账号统一 `info@根域`、SMTP host=`smtp.根域`、部署时自动加 `smtp` 子域 A 记录、Postfix 改 Cyrus SASL **sasldb 后端**、CSV 导出归一化（`domain,smtp_host,smtp_port,account,password,security`）。⚠️ 老 KumoMTA VPS 要重跑 Stage C 重渲 smtp_auth.lua 才认新账号 |
 | v0.2.6 | SMTP 导出格式第一次修（不完整，仍用 fqdn 做 host），被 v0.2.7 全栈对齐取代 |
 | v0.2.5 | 加「跳过 DNSBL 检测」开关（StageARequest.SkipDNSBL）：仅前缀过滤，20 IP 从 100-200s 缩到 20-40s；UI 黄色 checkbox 默认关 |
