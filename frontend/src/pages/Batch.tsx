@@ -34,8 +34,7 @@ declare global {
   }
 }
 
-// v0.2.14：日本两区并发筛选（东京 asia-northeast1 + 大阪 asia-northeast2）；
-// 翻倍 hold 池容量、双池子翻新独立，显著提升排除主力段（34./35.）时的命中率。
+// v0.2.15：region 锁回单区域东京 asia-northeast1（v0.2.14 双区域实测负优化已回退）。
 
 interface LogLine {
   slot?: number
@@ -324,7 +323,7 @@ export default function Batch() {
       gcp_cred_ids: [gcps[0].id],
       template_id: tplA,
       count: totalIPs,
-      regions: ['asia-northeast1', 'asia-northeast2'],
+      regions: ['asia-northeast1'],
       dnsbl_threshold: dnsblTh,
       max_retry_per_slot: maxRetry,
       ip_prefix_filter: [],
@@ -574,7 +573,7 @@ export default function Batch() {
 
               <div className="text-xs text-slate-400 bg-slate-900/40 border border-slate-700/40 rounded-md px-3 py-2 leading-relaxed">
                 <div>使用账号：<span className="text-indigo-300">{gcps[0]?.name || '（无可用 GCP 凭证）'}</span></div>
-                <div>区域：<span className="text-indigo-300">日本东京 + 大阪</span>（asia-northeast1 / asia-northeast2 双区并发，每区 175 IP 配额合计 350）</div>
+                <div>区域：<span className="text-indigo-300">日本东京 asia-northeast1</span>（已锁定；v0.2.14 双区实测负优化已回退）</div>
                 <div>IP 前缀：<span className="text-indigo-300">不过滤</span>（仅 DNSBL）</div>
               </div>
 
