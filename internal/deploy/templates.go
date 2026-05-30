@@ -126,17 +126,91 @@ func BuildSourcesBlock(srcs []SourceSpec) string {
 	return b.String()
 }
 
-// GenerateMailPassword 按默认规则生成邮箱密码（{domain} 替换为根域名第一段）
+// GenerateMailPassword 按默认规则生成邮箱密码（{domain} 替换为根域名第一段）。
+//
+// P0 安全修复（2026-05-30）：DefaultMailPassword 默认为空，旧实现会返回空串，
+// 导致 KumoMTA smtp_auth.lua / Postfix saslpasswd2 / chpasswd 全部注册空密码
+// → 587 开放中继 + 空密码系统账号。现改为：模板结果为空时回退到随机强密码。
+// 密码字符集限定 [A-Za-z0-9]（剔除易混字符），保证安全进入 shell（chpasswd /
+// saslpasswd2）、Lua 单引号字符串字面量、CSV 三处时都不会被特殊字符破坏转义。
+// 注意：同一次部署内 BuildDeployVars 只调一次，渲染 + 落库共用同一 v.Password，
+// CSV 从 DB 读，故单次部署天然一致；重跑 Stage C 会重新生成（同时更新 DB），
+// 需重新导出 CSV 给 brutal-mailer。
 func GenerateMailPassword(rootDomain string) string {
 	prefix := rootDomain
 	if i := strings.Index(rootDomain, "."); i > 0 {
 		prefix = rootDomain[:i]
 	}
-	return strings.ReplaceAll(DefaultMailPassword, "{domain}", prefix)
+	pw := strings.ReplaceAll(DefaultMailPassword, "{domain}", prefix)
+	if pw == "" {
+		pw = secureRandomPassword(20)
+	}
+	return pw
+}
+
+// secureRandomPassword 生成 n 位 [A-Za-z0-9] 随机密码（crypto/rand 源，剔除
+// 易混的 0/O/1/l/I）。仅用字母数字，确保密码可安全嵌入 shell 命令、Lua 字符串
+// 字面量与 CSV，不会触发引号/反斜杠/$ 等转义问题。
+func secureRandomPassword(n int) string {
+	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	if n <= 0 {
+		n = 20
+	}
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 失败极罕见；退回 hex（仍非空、仍随机），不破坏 P0 修复目标
+		h := hexRandom32()
+		if len(h) >= n {
+			return h[:n]
+		}
+		return h
+	}
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+	return string(b)
+}
+
+// isSafeDomainValue 仅允许 LDH 字符（字母/数字/点/连字符）。用于在模板渲染前校验
+// 域名类变量，确保它们安全嵌入 root 权限 shell 命令（hostnamectl / opendkim-genkey 等）
+// 与 KumoMTA Lua 单引号字符串字面量，杜绝 ' " $ ` ; | & 空格 () 等注入字符。
+func isSafeDomainValue(s string) bool {
+	if s == "" || len(s) > 253 || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateDeployDomains 在渲染任何模板前校验域名类变量（FQDN/RootDomain/Subdomain）。
+// 这是防 shell/Lua 注入的单点防线：render 是所有部署模板的唯一出口，任何域名只要含
+// 危险字符就在此被拒，KumoMTA/Postfix/mailcow/DKIM 全部路径一并受保护。
+// 注：Username=info@RootDomain 含 '@' 不单独校验（其域名部分已由 RootDomain 覆盖）；
+// Password 已在 GenerateMailPassword 限定 [A-Za-z0-9]；BindIP/Selector 为内部生成值。
+func validateDeployDomains(v DeployVars) error {
+	if !isSafeDomainValue(v.RootDomain) {
+		return fmt.Errorf("根域名 %q 含非法字符（仅允许字母数字 . -），拒绝渲染以防注入", v.RootDomain)
+	}
+	if !isSafeDomainValue(v.FQDN) {
+		return fmt.Errorf("FQDN %q 含非法字符（仅允许字母数字 . -），拒绝渲染以防注入", v.FQDN)
+	}
+	if v.Subdomain != "@" && !isSafeDomainValue(v.Subdomain) {
+		return fmt.Errorf("子域名 %q 含非法字符（仅允许字母数字 . -），拒绝渲染以防注入", v.Subdomain)
+	}
+	return nil
 }
 
 // render 读取嵌入模板并按 DeployVars 字段替换占位符
 func render(path string, v DeployVars) (string, error) {
+	if err := validateDeployDomains(v); err != nil {
+		return "", err
+	}
 	b, err := templatesFS.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("读取 %s 失败: %w", path, err)

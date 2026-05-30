@@ -367,7 +367,9 @@ func OAuthAuthorize(ctx context.Context) (tokenJSON []byte, projectID string, er
 		return nil, "", fmt.Errorf("OAuth 授权超时")
 	}
 
-	tok, err := cfg.Exchange(ctx, code)
+	// 用 timeoutCtx（5 分钟上限）而非父 ctx：父 ctx 多由 UI 直接发起、常无超时，
+	// token endpoint 卡住时 Exchange 会无限阻塞，授权流程挂死且无错误返回。
+	tok, err := cfg.Exchange(timeoutCtx, code)
 	if err != nil {
 		return nil, "", fmt.Errorf("交换 token 失败: %w", err)
 	}
