@@ -142,6 +142,8 @@ export default function Batch() {
   const [maxRetry, setMaxRetry] = useState(0)
   // v0.2.4：跳过 DNSBL 检测开关，默认关闭（保持严格审查）
   const [skipDNSBL, setSkipDNSBL] = useState(false)
+  // v0.2.16：region 单选。东京当前池 100% 是 34./35.，首尔 18% 是 8.230.x（实测）
+  const [selectedRegion, setSelectedRegion] = useState<string>('asia-northeast1')
   const [batchProgress, setBatchProgress] = useState<{ total: number; succeeded: number; failed: number; status: string } | null>(null)
   const batchStatus = batchProgress?.status || ''
   const [progressStartAt, setProgressStartAt] = useState<number>(0)
@@ -323,7 +325,7 @@ export default function Batch() {
       gcp_cred_ids: [gcps[0].id],
       template_id: tplA,
       count: totalIPs,
-      regions: ['asia-northeast1'],
+      regions: [selectedRegion],
       dnsbl_threshold: dnsblTh,
       max_retry_per_slot: maxRetry,
       ip_prefix_filter: [],
@@ -573,7 +575,22 @@ export default function Batch() {
 
               <div className="text-xs text-slate-400 bg-slate-900/40 border border-slate-700/40 rounded-md px-3 py-2 leading-relaxed">
                 <div>使用账号：<span className="text-indigo-300">{gcps[0]?.name || '（无可用 GCP 凭证）'}</span></div>
-                <div>区域：<span className="text-indigo-300">日本东京 asia-northeast1</span>（已锁定；v0.2.14 双区实测负优化已回退）</div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span>区域：</span>
+                  <select className="bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1 text-xs focus:border-indigo-500 outline-none"
+                          value={selectedRegion} onChange={e => setSelectedRegion(e.target.value)}>
+                    <option value="asia-northeast1">日本东京 asia-northeast1（当前池 ≈100% 是 34./35.）</option>
+                    <option value="asia-northeast2">日本大阪 asia-northeast2（实测 100% 是 34.97）</option>
+                    <option value="asia-northeast3">韩国首尔 asia-northeast3（约 18% 是 8.230.x，避开 34./35. 推荐 ⭐）</option>
+                  </select>
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5">
+                  {selectedRegion === 'asia-northeast3'
+                    ? '⭐ 首尔池有 8.230.x 段（约 18% 命中），适合排除 34./35. 的场景。韩国到日本邮箱网络 ~50ms。'
+                    : selectedRegion === 'asia-northeast2'
+                      ? '⚠️ 大阪池实测全是 34.97 段，排除 34./35. 时无法筛出。'
+                      : '⚠️ 东京池当前 100% 是 34./35.，排除时筛不出非主力段（除非池子换轮）。'}
+                </div>
                 <div>IP 前缀：<span className="text-indigo-300">不过滤</span>（仅 DNSBL）</div>
               </div>
 

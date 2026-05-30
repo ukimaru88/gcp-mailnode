@@ -95,13 +95,22 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 	if _, err := loadTemplate(req.TemplateID); err != nil {
 		return "", err
 	}
-	// v0.2.15：回退到单区域东京。v0.2.14 解锁双区域（东京+大阪）的实测结果反而更差——
-	// 1000+ reserve 都没命中非 34./35.，因为 worker 50/50 分流让东京 hold 池只撑到 ~87
-	// 个（远不到 175 配额顶），破坏了 dirtyIPHolder "占满池子触发 GCP 翻新"的核心机制；
-	// 同时大阪池实测 100% 是 34.97 段（cmd/ippool 验证），双区不仅没翻倍命中率，反而
-	// 把东京原本能命中 104./136. 的概率砍半。
-	// 静态 IP 是 region 绑定，多 NIC 所有 IP 必须同 region；单 NIC 也锁定避免漂移。
+	// v0.2.16：region 改为前端可选（默认东京）。实测发现：
+	//   - 东京 asia-northeast1：当前池 100% 是 34./35.（cmd/ippool 验证 150/150）
+	//   - 大阪 asia-northeast2：100% 是 34.97 段
+	//   - 韩国 asia-northeast3：18% 是 8.230.x 段（27/150 命中非 34./35.）★
+	// 用户要避开 34./35. 时选首尔，业务强制日本时选东京。多区域并发是负优化
+	// （v0.2.14 实测：worker 分流稀释 hold，反而破坏 dirtyIPHolder "占满池触发翻新"机制），
+	// 所以前端给单选不是多选；req.Regions 仍是 slice 兼容多 NIC 设计但实际用第一个。
+	// 静态 IP 是 region 绑定，多 NIC 所有 IP 必须同 region；同 batch 锁单 region 避免漂移。
 	regions := []string{"asia-northeast1"}
+	if len(req.Regions) > 0 {
+		first := strings.TrimSpace(req.Regions[0])
+		switch first {
+		case "asia-northeast1", "asia-northeast2", "asia-northeast3":
+			regions = []string{first}
+		}
+	}
 	if onLog == nil {
 		onLog = func(string, int, string, string) {}
 	}
