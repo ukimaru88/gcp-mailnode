@@ -95,10 +95,13 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 	if _, err := loadTemplate(req.TemplateID); err != nil {
 		return "", err
 	}
-	// v0.1.57：所有 mail-node 业务统一锁东京（asia-northeast1）。
-	// 静态 IP 是 region 绑定的，多 NIC 模式所有 IP 必须同 region；
-	// 普通单 NIC 模式也跟着锁定，避免轮转漂移到大阪。
-	regions := []string{"asia-northeast1"}
+	// v0.2.14：日本两个 region 并发筛选（东京 + 大阪），翻倍 hold 池容量、池子翻新独立，
+	// 显著提升非 34./35. 段 IP 命中率（用户排除主力段时的关键提速）。
+	// 单 NIC 模式：每个 IP 自带 region 字段（static_ips.region），Stage B 按 IP 的 region
+	// 自动决定 VM zone（stages.go:773 region+"-"+sfx），无需同 batch 内强制单 region。
+	// 多 NIC 模式：groupCleanIPs 按 (gcp_cred_id, region) 分组，同组内 IP 必同 region，
+	// 不跨 region 拼 NIC——天然安全。
+	regions := []string{"asia-northeast1", "asia-northeast2"}
 	if onLog == nil {
 		onLog = func(string, int, string, string) {}
 	}

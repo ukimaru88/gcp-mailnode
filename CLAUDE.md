@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.13**（`version.txt`；修 render() 把 `${FQDN}` shell 变量误替换的根因 bug）
+> 当前版本：**v0.2.14**（`version.txt`；解锁日本东京+大阪双区域并发筛 IP）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.13** | 最新。**修 render() 渲染器根因 bug**（v0.2.3 引入 Postfix 路径起就存在）：`strings.ReplaceAll(s, "{FQDN}", v.FQDN)` 会把 shell 变量引用 `${FQDN}` 中的 `{FQDN}` 子串也替换，导致 `${FQDN}` → `$madouchuanm.com` → bash 把 `$madouchuanm` 当未定义变量展开成空 → 实际值变成 ".com" → /etc/hostname=.com → myhostname=.com → postfix master fatal exit。**这就是之前 v0.2.10 实测的 `myhostname=.com` 真根因**，v0.2.11 sanity check 只拦了部署没修根因。修法：render 三阶段——① 用 sentinel `\x00GMSHELL\x00<i>` 保护所有 `${VAR}/${VAR%xx}` 引用 ② 替换 Go 占位符 ③ 恢复 shell 引用。新增 `TestRender_PreservesShellVarRefs` 防回归。顺带修同名子串 bug：`{FQDN_BARE}` 必须在 `{FQDN}` 之前替换 |
+| **v0.2.14** | 最新。**解锁日本东京+大阪双区域并发筛 IP**：之前 stages.go:101 锁死 `asia-northeast1`，用户排除 34./35. 主力段时 hold 池单区域 175 配额一撞顶就 60s 冷却。改为 `["asia-northeast1", "asia-northeast2"]` 双区并发，**hold 池容量翻倍 350、两个池子翻新独立**，非 34./35.（如 104./136.）命中率显著上升。Stage B 已天然支持（IP 自带 region，自动选 zone）；多 NIC `groupCleanIPs` 按 (cred\|region) 分区保证同组同区不跨拼。UI Step 1 卡片提示"日本东京 + 大阪 双区并发"。app_templates.go 预设 Regions 同步两区域 |
+| v0.2.13 | **修 render() 渲染器根因 bug**（v0.2.3 引入 Postfix 路径起就存在）：`strings.ReplaceAll(s, "{FQDN}", v.FQDN)` 会把 shell 变量引用 `${FQDN}` 中的 `{FQDN}` 子串也替换，导致 `${FQDN}` → `$madouchuanm.com` → bash 把 `$madouchuanm` 当未定义变量展开成空 → 实际值变成 ".com" → /etc/hostname=.com → myhostname=.com → postfix master fatal exit。**这就是之前 v0.2.10 实测的 `myhostname=.com` 真根因**，v0.2.11 sanity check 只拦了部署没修根因。修法：render 三阶段——① 用 sentinel `\x00GMSHELL\x00<i>` 保护所有 `${VAR}/${VAR%xx}` 引用 ② 替换 Go 占位符 ③ 恢复 shell 引用。新增 `TestRender_PreservesShellVarRefs` 防回归。顺带修同名子串 bug：`{FQDN_BARE}` 必须在 `{FQDN}` 之前替换 |
 | v0.2.12 | **DNSBL DoH 加速**：之前零值 net.Resolver 走系统 stub resolver 把 25 个 RBL 并发查询串行化，单 IP ~25s；尝试 PreferGo + 直打 1.1.1.1:53 又被本地路由器封 53 端口（UDP/TCP 都不通）；最终方案 DoH (DNS over HTTPS) 走 443，绕开 53 封锁。Cloudflare + Google JSON API 轮询，HTTP/2 keep-alive 复用。实测单 IP 26 RBL 0.08s 健康检查 / 3.00s 满量查询（=defaultTimeout 上限），**用户 20 IP 并发场景预计 60s → 3-5s**（6-10× 提速）。改动单点：[dnsbl.go](internal/dnsbl/dnsbl.go) queryZone 调 dohLookup 替代 net.Resolver |
 | v0.2.11 | **Postfix 真机部署事故修复**：一次实测发现 `myhostname=.com` 导致 postfix master 起不来、但脚本只报"端口没监听"无法定位（根因未确定，疑似前端域名输入或 Stage C race）。三道防线：① install_postfix.sh 渲染变量后立即 sanity check（FQDN/DOMAIN 不能为空/不能 . 开头-结尾/必须含 .），异常直接 exit 11 ② 自检失败时 dump postfix check + systemctl status + journalctl + mail.log + main.cf + /etc/hostname + /etc/hosts ③ Go 端 deployPostfixOnVPS 入口 log 入参与 BuildDeployVars 结果（domain/subdomain/v.FQDN/v.RootDomain），下次出问题能立即看到 ④ 前端 parseDomains 拒绝以 . 开头/结尾、不含 . 的非法行 |
 | v0.2.10 | ① 导出新增 `toolkit_short`（`info@根域----密码`，对齐 mail-toolkit 简短导出）+ `toolkit_full`（`账号----密码----host:port----security`）两种 `----` 格式，Export 页加按钮 ② **批量部署第三步加「搭建方式」选择**（跟随模板/KumoMTA/Postfix）：`StageCRequest.DeployType` + `DeployOpts.DeployType` 当场覆盖模板默认，多 NIC 自动回退 kumomta；Batch.tsx Stage C 弹窗加三选按钮 |

@@ -205,7 +205,7 @@ func ensurePresetTemplates() error {
 	presets := []VPSTemplateDTO{
 		{
 			Name:              "日本 e2-micro × 单 NIC × 完美 PTR（默认，$8.4/月/台）",
-			Regions:           []string{"asia-northeast1"},
+			Regions:           []string{"asia-northeast1", "asia-northeast2"},
 			MachineType:       "e2-micro",
 			DiskSizeGB:        10,
 			DiskType:          "pd-balanced",
