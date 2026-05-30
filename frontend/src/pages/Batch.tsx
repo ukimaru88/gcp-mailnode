@@ -404,7 +404,12 @@ export default function Batch() {
 
   // 解析纯域名列表（按行 trim，忽略空行和 # 注释）
   const parseDomains = (text: string): string[] =>
-    text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#'))
+    // v0.2.11：除空行/注释外，拒绝以 . 开头/结尾、不含 . 的伪域名（避免传给后端拼出 ".com" 这种坏 FQDN，
+    // 之前有过一次 myhostname=.com 导致 postfix master 起不来的事故）
+    text.split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith('#'))
+      .filter(l => l.includes('.') && !l.startsWith('.') && !l.endsWith('.'))
 
   // 按顺序把域名和本批次 VPS IP 配对
   const buildDomainIPMap = (): { map: Record<string, string>; pairs: Array<{ domain: string; ip: string }>; extraDomains: string[]; extraVPS: Array<{ ip: string; name: string }> } => {

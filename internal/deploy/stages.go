@@ -1726,7 +1726,10 @@ func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdom
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
 
-	log("INFO", "开始安装 Postfix + OpenDKIM（域=%s 主机=%s 邮箱=%s@%s）", v.RootDomain, v.FQDN, v.Username, v.RootDomain)
+	// v0.2.11：dump 入参与渲染结果，便于排查 v.FQDN/v.RootDomain 不一致这类离谱 bug。
+	log("INFO", "[debug] deployPostfixOnVPS 入参 domain=%q subdomain=%q ip=%q", domain, subdomain, ip)
+	log("INFO", "[debug] BuildDeployVars 结果 FQDN=%q RootDomain=%q Subdomain=%q Username=%q", v.FQDN, v.RootDomain, v.Subdomain, v.Username)
+	log("INFO", "开始安装 Postfix + OpenDKIM（域=%s 主机=%s 邮箱=%s）", v.RootDomain, v.FQDN, v.Username)
 	installScript, err := RenderInstallPostfix(v)
 	if err != nil {
 		return fmt.Errorf("RenderInstallPostfix: %w", err)

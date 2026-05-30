@@ -137,6 +137,21 @@ ensure_smtp_ports_ready() {
     log_error "SMTP port self-check failed (25/587/465/2525), stop deployment."
     log_info "Listening SMTP processes:"
     ss -lntp 2>/dev/null | grep -E ':(25|587|465|2525)\b' || true
+    # v0.2.11：失败时 dump 真因，避免下次再黑盒猜（之前一次实测 v.FQDN=".com" → myhostname=.com →
+    # postfix master fatal exit，但日志只报"端口没监听"）
+    log_info "===== postfix check ====="
+    postfix check 2>&1 || true
+    log_info "===== systemctl status postfix (last 20 lines) ====="
+    systemctl status postfix --no-pager -l 2>&1 | tail -20 || true
+    log_info "===== journalctl -u postfix (last 30 lines) ====="
+    journalctl -u postfix --no-pager -n 30 2>&1 || true
+    log_info "===== mail.log tail (last 30 lines) ====="
+    tail -30 /var/log/mail.log 2>/dev/null || true
+    log_info "===== main.cf myhostname/mydomain/inet_* ====="
+    grep -E "^(myhostname|mydomain|myorigin|mydestination|inet_)" /etc/postfix/main.cf 2>&1 || true
+    log_info "===== /etc/hostname + /etc/hosts ====="
+    cat /etc/hostname 2>&1
+    cat /etc/hosts 2>&1
     exit 1
   fi
 
@@ -184,6 +199,25 @@ FQDN="{FQDN}"
 DOMAIN="{DOMAIN}"
 SERVER_IP="{BIND_IP}"
 SELECTOR="{SELECTOR}"
+
+# v0.2.11：sanity check 渲染结果。一旦 Go 端把 ".com" 之类的残缺值塞进来，立即 fail-fast，
+# 避免写出 myhostname=.com 让 postfix master 起不来。条件：必须包含至少 1 个非首位的点，
+# 且不能以点开头/结尾。
+_check_host() {
+  local name="$1"
+  local val="$2"
+  if [ -z "${val}" ]; then
+    log_error "${name} 为空（Go 端渲染异常）"; return 1
+  fi
+  case "${val}" in
+    .*|*.) log_error "${name}=${val} 以点开头/结尾，非法主机名（Go 端渲染异常）"; return 1 ;;
+    *.*) return 0 ;;
+    *) log_error "${name}=${val} 不含点，非法主机名（Go 端渲染异常）"; return 1 ;;
+  esac
+}
+_check_host FQDN "${FQDN}" || { log_error "渲染参数异常，停止部署。请检查 gcp-mailnode 端 Stage C 的域名传入。"; exit 11; }
+_check_host DOMAIN "${DOMAIN}" || { log_error "渲染参数异常，停止部署。请检查 gcp-mailnode 端 Stage C 的域名传入。"; exit 11; }
+log_info "[sanity] FQDN=${FQDN} DOMAIN=${DOMAIN} SELECTOR=${SELECTOR}"
 # v0.2.6：{USERNAME} = info@根域名（mail-toolkit 约定）。
 # Cyrus SASL sasldb 后端把它整段当 SASL 用户名存（带 @），SMTP 登录用整串。
 # 同时为本地邮件路由也建一个纯前缀的系统用户（Maildir 兜底，发件不依赖）。
