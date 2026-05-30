@@ -463,7 +463,8 @@ func (a *App) BatchDelete(resourceType string, ids []string) (int, error) {
 //	"smtp"      → ip:port:user:pass（兼容老 brutal-mailer）
 //	"smtp_v2"   → ip:port:user:pass:persona_type:hide_ip（brutal-mailer v2.3.37+，可直接按账号绑定 persona）
 //	"smtp_v3"   → ip:port:user:pass:persona_type:hide_ip:unsub_url:unsub_secret（v0.1.74+，含一键退订）
-//	"toolkit"   → fqdn----ip----root----rootpass（mail-toolkit 格式）
+//	"toolkit"   → CSV with header: domain,smtp_host,smtp_port,account,password,security
+//	              （v0.2.5：与 mail-toolkit ExportSmtpCsv 完全一致；可直接合并两边的 CSV）
 func (a *App) ExportSMTP(format string) (string, error) {
 	db, err := requireDB()
 	if err != nil {
@@ -484,6 +485,10 @@ func (a *App) ExportSMTP(format string) (string, error) {
 	}
 	defer rows.Close()
 	var lines []string
+	// v0.2.5：toolkit 格式与 mail-toolkit ExportSmtpCsv 一致，先打 CSV 表头
+	if format == "toolkit" {
+		lines = append(lines, "domain,smtp_host,smtp_port,account,password,security")
+	}
 	for rows.Next() {
 		var (
 			ip, fqdn, domain, acct, pass, rootPwd, personaName, unsubSecret string
@@ -496,7 +501,19 @@ func (a *App) ExportSMTP(format string) (string, error) {
 		personaType := personaNameToBrutalType(personaName)
 		switch format {
 		case "toolkit":
-			lines = append(lines, fmt.Sprintf("%s----%s----root----%s", fqdn, ip, rootPwd))
+			// v0.2.6：与 mail-toolkit ExportSmtpCsv 完全一致：domain,smtp_host,smtp_port,account,password,security
+			// smtp_host = smtp.{根域名}（mail-toolkit 约定；部署时已加 smtp A 记录指向 server_ip）
+			// account = info@{根域名}（从 smtp_account 归一化：取 @ 前缀 + @根域，兼容老数据里 info@fqdn）
+			_ = rootPwd
+			_ = fqdn // 不再用 fqdn 做 host；smtp.{域} 是统一入口
+			account := acct
+			if at := strings.LastIndex(account, "@"); at >= 0 {
+				account = account[:at] + "@" + domain
+			} else if account != "" {
+				account = account + "@" + domain
+			}
+			lines = append(lines, fmt.Sprintf("%s,smtp.%s,587,%s,%s,STARTTLS",
+				domain, domain, account, pass))
 		case "smtp_v2":
 			lines = append(lines, fmt.Sprintf("%s:587:%s:%s:%s:%d", ip, acct, pass, personaType, hideIP))
 		case "smtp_v3":

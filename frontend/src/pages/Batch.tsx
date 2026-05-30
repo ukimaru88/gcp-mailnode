@@ -136,10 +136,12 @@ export default function Batch() {
   const [tplA, setTplA] = useState('')
   const [vpsCount, setVpsCount] = useState(1)
   const [dnsblTh, setDnsblTh] = useState(1)
-  // v0.1.72：IP 前缀黑名单恢复 UI 配置；默认排除 34.（GCP 日本区 95% 是 34.x，声誉差）
-  const [ipPrefixExclude, setIpPrefixExclude] = useState<string>('34.')
+  // v0.1.72：IP 前缀黑名单恢复 UI 配置；默认排除 34. / 35.（两段都是 GCP 标识段，声誉差）
+  const [ipPrefixExclude, setIpPrefixExclude] = useState<string>('34.\n35.')
   // 0 = 无限循环直到达到目标或所有 region 配额耗尽；>0 = 总尝试上限 = N * 此值
   const [maxRetry, setMaxRetry] = useState(0)
+  // v0.2.4：跳过 DNSBL 检测开关，默认关闭（保持严格审查）
+  const [skipDNSBL, setSkipDNSBL] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ total: number; succeeded: number; failed: number; status: string } | null>(null)
   const batchStatus = batchProgress?.status || ''
   const [progressStartAt, setProgressStartAt] = useState<number>(0)
@@ -325,6 +327,7 @@ export default function Batch() {
       ip_prefix_filter: [],
       ip_prefix_exclude: ipPrefixExclude.split('\n').map(s => s.trim()).filter(s => s.length > 0),
       nic_count: tplNICCount,
+      skip_dnsbl: skipDNSBL,
     } as any
 
     try {
@@ -610,7 +613,20 @@ export default function Batch() {
                   placeholder="34.&#10;例如：34. / 35.230. / 35."
                   value={ipPrefixExclude}
                   onChange={e => setIpPrefixExclude(e.target.value)} />
-                <p className="text-[10px] text-slate-500 mt-0.5">默认排除 <span className="text-amber-400 font-mono">34.</span>（GCP 日本区 95% 是 34.x，声誉差）。清空则不过滤。</p>
+                <p className="text-[10px] text-slate-500 mt-0.5">默认排除 <span className="text-amber-400 font-mono">34.</span> / <span className="text-amber-400 font-mono">35.</span>（GCP 段，声誉差）。清空则不过滤。</p>
+              </div>
+
+              <div className={`p-3 rounded-md border ${skipDNSBL ? 'bg-amber-500/10 border-amber-500/40' : 'bg-slate-900/50 border-slate-700'}`}>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" className="accent-amber-500"
+                         checked={skipDNSBL} onChange={e => setSkipDNSBL(e.target.checked)} />
+                  <span className="text-sm text-slate-200">跳过 DNSBL 检测（只看 IP 前缀）</span>
+                </label>
+                <p className="text-[10px] text-slate-400 mt-1 ml-6">
+                  {skipDNSBL
+                    ? '⚠ 关闭了 25 个 RBL 黑名单的全栈检查；仅前缀过滤生效。适合主流邮箱（Gmail/Outlook/Yahoo）不查的 UCEPROTECT/SORBS-DUL/SpamRATS 等噪声列表把好 IP 误判脏的场景。速度大幅提升。'
+                    : '默认关闭，按 DNSBL 阈值审查所有 RBL 列表。开关后只受上面的"IP 前缀黑名单"约束。'}
+                </p>
               </div>
 
               <div className="flex items-center justify-between pt-2">
@@ -925,7 +941,11 @@ export default function Batch() {
               {(() => {
                 const types = new Set(batchVPS.filter(v => v.ip && v.deploy_status === 'vps_running').map(v => (v as any).deploy_type || 'kumomta'))
                 if (types.size === 0) return null
-                const list = Array.from(types).map(t => t === 'mailcow' ? '📥 mailcow（收发一体）' : '🚀 KumoMTA（纯发信）').join(' / ')
+                const list = Array.from(types).map(t => {
+                  if (t === 'mailcow') return '📥 mailcow（收发一体）'
+                  if (t === 'postfix') return '📬 Postfix + OpenDKIM（纯发信）'
+                  return '🚀 KumoMTA（纯发信）'
+                }).join(' / ')
                 return <div className="mt-1 text-slate-500">将按模板类型部署：<span className="text-indigo-300">{list}</span></div>
               })()}
             </div>

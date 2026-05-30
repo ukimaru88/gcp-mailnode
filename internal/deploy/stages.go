@@ -35,6 +35,10 @@ type StageARequest struct {
 	// v0.1.57：每台 VPS 的 NIC 数（=每台绑几个静态 IP）。0/1=单 NIC 模式
 	// 来自 vps_templates.nic_count；前端始终从模板读后透传
 	NICCount int `json:"nic_count"`
+	// v0.2.4：跳过 DNSBL 检测，只做 IP 前缀过滤。
+	// 用户场景：主流邮箱不查 UCEPROTECT/SORBS-DUL/SpamRATS-Dyna 等噪声列表，
+	// 全栈检查会把对实际发件无影响的 IP 误判为脏。开此开关后仅前缀过滤，速度大幅提升。
+	SkipDNSBL bool `json:"skip_dnsbl"`
 }
 
 type StageBRequest struct {
@@ -108,6 +112,28 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 	runCtx, cancel := context.WithCancel(ctx)
 	state := &batchState{id: batchID, total: req.Count, status: "stage-a-running", cancel: cancel}
 	runningBatches.Store(batchID, state)
+
+	// v0.2.3：继承之前批次未使用的 clean+unbound IP，并入当前 batch。
+	// 用户痛点：第一次筛 20 个只拿到 7 个，重新启动会让那 7 个从界面"消失"——其实只是被
+	// 旧 batch_id 隔离了。把它们 reparent 到新 batch 后，剩下只需要补 (Count - 继承数) 个。
+	// 同时把 state.succeeded 预填为继承数量，让"目标达到"判断和 UI 计数正确。
+	// 多 NIC 的分组（slot_group）会在 Stage A 结束时由 groupCleanIPs 按当前 NICCount 重算，无需在这里处理。
+	if res, err := db.ExecContext(ctx,
+		`UPDATE static_ips
+		    SET batch_id=?, slot_group=''
+		  WHERE batch_id<>? AND status='clean' AND bound_instance_id=''`,
+		batchID, batchID); err == nil {
+		if inherited, _ := res.RowsAffected(); inherited > 0 {
+			atomic.StoreInt64(&state.succeeded, inherited)
+			remaining := int64(req.Count) - inherited
+			if remaining < 0 {
+				remaining = 0
+			}
+			onLog(batchID, 0, "INFO",
+				fmt.Sprintf("继承上次未用的 clean IP %d 个，目标 %d，本次仍需筛选 %d 个",
+					inherited, req.Count, remaining))
+		}
+	}
 
 	go func() {
 		defer finishStageTask(db, batchID, state, "stage-a-done")
@@ -190,24 +216,51 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 				if maxTotalAttempts > 0 && attempts > maxTotalAttempts {
 					return
 				}
-				// 所有 region 都耗尽配额就退出，没必要死循环
-				allBlown := true
+				// v0.2.2：region 不再永久 exhausted；每次只是 60s 软冷却。
+				// 所有 region 都在冷却 → sleep 到最早一个解冻再继续，而不是退出 worker。
+				// 用户语义："企业账号无配额限制，请一直筛选直到达到目标 N。"
+				nextWakeup := time.Time{}
+				now := time.Now()
+				allCooling := true
 				for _, r := range regions {
-					if _, blown := exhausted.Load(r); !blown {
-						allBlown = false
+					if v, blown := exhausted.Load(r); blown {
+						until := v.(time.Time)
+						if now.After(until) {
+							exhausted.Delete(r) // 冷却到期 → 解冻
+							allCooling = false
+							break
+						}
+						if nextWakeup.IsZero() || until.Before(nextWakeup) {
+							nextWakeup = until
+						}
+					} else {
+						allCooling = false
 						break
 					}
 				}
-				if allBlown {
-					return
+				if allCooling {
+					sleep := time.Until(nextWakeup) + time.Second
+					if sleep > 0 {
+						select {
+						case <-runCtx.Done():
+							return
+						case <-time.After(sleep):
+						}
+					}
+					continue
 				}
 
 				attempt := atomic.LoadInt64(&totalAttempts)
 				gcpCredID := req.GCPCredIDs[int(attempt-1)%len(req.GCPCredIDs)]
 				region := regions[int(attempt-1)%len(regions)]
 
-				if _, blown := exhausted.Load(region); blown {
-					continue
+				if v, blown := exhausted.Load(region); blown {
+					until := v.(time.Time)
+					if now.After(until) {
+						exhausted.Delete(region)
+					} else {
+						continue
+					}
 				}
 
 				cli, err := getGCP(gcpCredID)
@@ -220,7 +273,8 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 					return
 				}
 				if err := reserveAndFilterOnce(runCtx, batchID, workerID, gcpCredID, region,
-					req.DNSBLThreshold, req.IPPrefixFilter, req.IPPrefixExclude, &exhausted, cli, onLog, claimSlot, dirty); err != nil {
+					req.DNSBLThreshold, req.IPPrefixFilter, req.IPPrefixExclude, req.SkipDNSBL,
+					&exhausted, cli, onLog, claimSlot, dirty); err != nil {
 					continue
 				}
 				// 成功写 clean 的槽位已由 reserveAndFilterOnce 通过 claimSlot 原子占上
@@ -268,7 +322,7 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 // reserveAndFilterOnce 单次尝试：预留 + 前缀 + 黑段 + DNSBL 判定。
 // 判定为 clean 时调用 claimSlot 原子抢占槽位；抢到才写 status=clean，抢不到（已达目标）立刻释放 IP 避免烧钱。
 // 返回 nil 表示本次成功占位+写入；其他情况返回 err，调用方继续下一轮抽取。
-func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcpCredID, region string, threshold int, prefixFilter, prefixExclude []string, exhausted *sync.Map, gcpClient *gcp.Client, onLog LogCallback, claimSlot func() bool, dirty *dirtyIPHolder) error {
+func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcpCredID, region string, threshold int, prefixFilter, prefixExclude []string, skipDNSBL bool, exhausted *sync.Map, gcpClient *gcp.Client, onLog LogCallback, claimSlot func() bool, dirty *dirtyIPHolder) error {
 	log := func(level, format string, args ...interface{}) {
 		onLog(batchID, workerID, level, fmt.Sprintf(format, args...))
 	}
@@ -314,12 +368,14 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 					return fmt.Errorf("quota_temp_full_retry")
 				}
 			}
-			// flush 后仍然 quota_exceeded（或 holder 为空），才真正标 region exhausted
+			// v0.2.2：不再永久 exhausted —— 改为 60s 软冷却（cooldown），到期 worker 自动重试。
+			// 企业账号场景下 quota_exceeded 通常是临时（其他批次正在用、刚释放未真正回池）；
+			// 永久退出会让用户感觉"还没到目标软件就停了"。
 			if exhausted != nil {
-				exhausted.Store(region, true)
+				exhausted.Store(region, time.Now().Add(60*time.Second))
 			}
-			log("WARN", "region %s 静态 IP 配额耗尽（flush 后仍满），暂停该 region 抽取。请到 GCP Console 提额。", region)
-			return fmt.Errorf("region %s QUOTA_EXCEEDED", region)
+			log("WARN", "region %s 静态 IP 配额暂满（flush 后仍满），冷却 60s 后自动重试", region)
+			return fmt.Errorf("region %s QUOTA_EXCEEDED_COOLDOWN", region)
 		}
 		log("ERROR", "预留静态 IP 失败: %v", err)
 		return err
@@ -365,6 +421,35 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 		log("WARN", "IP %s 命中前缀黑名单 %s，暂存脏 IP", addr.IP, hit)
 		holdDirty("prefix_excluded", hit)
 		return fmt.Errorf("prefix_excluded")
+	}
+	// v0.2.4：用户开"跳过 DNSBL"时直接走 claimSlot 标 clean，
+	// 不再查历史 / 不查黑段 / 不发 DNSBL 请求。只受前缀过滤约束。
+	if skipDNSBL {
+		if claimSlot != nil && !claimSlot() {
+			log("INFO", "IP %s (跳过 DNSBL) 但已达目标 N，释放", addr.IP)
+			release("released", "target_reached", "")
+			return fmt.Errorf("target_reached")
+		}
+		log("INFO", "IP %s 通过（跳过 DNSBL，仅前缀过滤）", addr.IP)
+		_, _ = db.ExecContext(ctx,
+			`UPDATE static_ips SET status='clean', dnsbl_result='skipped' WHERE id=?`, ipID)
+		return nil
+	}
+
+	// v0.2.2：跨批次记忆——同一 IP 之前被判脏过（含 prefix_excluded/blacklisted/dnsbl 任何脏 verdict），
+	// 直接 hold-dirty 跳过 DNSBL，省 ~5s 网络往返。
+	// 排除自身这次刚插的 reserved 行（ipID）。
+	var pastVerdict, pastHits string
+	_ = db.QueryRowContext(ctx,
+		`SELECT dnsbl_result, COALESCE(dnsbl_hit_lists,'') FROM static_ips
+		 WHERE ip=? AND id<>? AND status IN ('dirty','released')
+		 AND dnsbl_result IS NOT NULL AND dnsbl_result<>'' AND dnsbl_result<>'dnsbl_error'
+		 ORDER BY rowid DESC LIMIT 1`,
+		addr.IP, ipID).Scan(&pastVerdict, &pastHits)
+	if pastVerdict != "" && pastVerdict != "clean" {
+		log("WARN", "IP %s 历史已判脏 (%s)，跳过 DNSBL 直接暂存", addr.IP, pastVerdict)
+		holdDirty(pastVerdict, pastHits)
+		return fmt.Errorf("known_dirty:%s", pastVerdict)
 	}
 	if seg, note, berr := dnsbl.ContainsIP(ctx, addr.IP); berr == nil && seg != "" {
 		log("WARN", "IP %s 命中黑段 %s(%s)，暂存脏 IP", addr.IP, seg, note)
@@ -448,9 +533,9 @@ func StartStageB(ctx context.Context, batchID string, req StageBRequest, onLog L
 				g.slotGroup[:min(8, len(g.slotGroup))], len(g.ips), expectedNICs)
 		}
 	}
-	// 多 NIC 模板必须走 KumoMTA（mailcow 不支持多 NIC 部署链路）
+	// 多 NIC 模板必须走 KumoMTA（mailcow / postfix 不支持多 NIC 部署链路）
 	if expectedNICs > 1 && tmpl.DeployType != "" && tmpl.DeployType != "kumomta" {
-		return fmt.Errorf("多 NIC 模板（NICCount=%d）只支持 KumoMTA 部署，当前模板 deploy_type=%s",
+		return fmt.Errorf("多 NIC 模板（NICCount=%d）只支持 KumoMTA 部署，当前模板 deploy_type=%s（postfix/mailcow 均为单 NIC）",
 			expectedNICs, tmpl.DeployType)
 	}
 
@@ -1206,6 +1291,10 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, internalIP, fqdn, subdomain,
 		log("INFO", "部署类型=mailcow（收发一体邮件服务器）")
 		return deployMailcowOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, aliyunDNS, aliyunCredID, log)
 	}
+	if deployType == "postfix" {
+		log("INFO", "部署类型=postfix（Postfix + OpenDKIM 纯发信）")
+		return deployPostfixOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, aliyunDNS, aliyunCredID, log)
+	}
 	log("INFO", "部署类型=kumomta（纯发信 MTA）")
 
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
@@ -1381,6 +1470,9 @@ chmod +x /tmp/deploy_config.sh
 			{RR: rrs.MX, RecordType: "MX", Value: fqdn, Priority: &mxPriority},
 			{RR: rrs.SPF, RecordType: "TXT", Value: spfValue},
 			{RR: rrs.DMARC, RecordType: "TXT", Value: fmt.Sprintf("v=DMARC1; p=reject; rua=mailto:dmarc@%s", domain)},
+			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→主 NIC IP；
+			// 多 NIC 模式下也只指向主 IP，多个 IP 通过 mail1..mailN 子域分散
+			{RR: "smtp", RecordType: "A", Value: ip},
 		}
 		// v0.1.57：多 NIC 时 mail1~mailN A 记录指向各自 IP（Received 链 / EHLO 三方匹配的关键）
 		if len(allIPs) > 1 {
@@ -1579,6 +1671,71 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// deployPostfixOnVPS 在 VPS 上部署 Postfix + OpenDKIM（纯发信，与 mail-toolkit 同源脚本）
+//
+// 与 KumoMTA 路径的差异：
+//   - 只装 Postfix + OpenDKIM（无 KumoMTA Lua 配置 / 无多 NIC source 池）
+//   - 不部署 unsub-server（unsub 仅 KumoMTA 路径走）
+//   - DKIM 公钥从 install_postfix.sh 的 stdout 行 "DKIM_PUBLIC_KEY=..." 捕获
+//   - DNS 记录与 KumoMTA 单 NIC 场景一致：DKIM/MX/SPF/DMARC
+func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
+	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
+	v := BuildDeployVars(domain, subdomain, ip)
+
+	log("INFO", "开始安装 Postfix + OpenDKIM（域=%s 主机=%s 邮箱=%s@%s）", v.RootDomain, v.FQDN, v.Username, v.RootDomain)
+	installScript, err := RenderInstallPostfix(v)
+	if err != nil {
+		return fmt.Errorf("RenderInstallPostfix: %w", err)
+	}
+
+	// Postfix + apt 装包耗时较长（首次 ~3-5 分钟），流式输出到日志
+	out, err := ssh.RunScript(ctx, sshCfg, installScript, func(stream, line string) {
+		if line != "" {
+			log("INFO", "[postfix/%s] %s", stream, line)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("install_postfix 失败: %w", err)
+	}
+
+	// 从 stdout 捕获 DKIM_PUBLIC_KEY=...（脚本 Phase 6 输出）
+	dkimPub := extractDKIMPublicKey(out)
+	if dkimPub == "" {
+		return fmt.Errorf("DKIM 公钥提取失败（脚本未输出 DKIM_PUBLIC_KEY 行）")
+	}
+	log("INFO", "DKIM 公钥已提取（%d chars）", len(dkimPub))
+
+	// v0.2.6：SASL 用 sasldb，登录串 = info@根域名（v.Username）。
+	// 与 KumoMTA 路径一致；mail-toolkit 约定也是 From=登录串=info@根域。
+	_, _ = db.ExecContext(ctx,
+		`UPDATE vps_instances SET dkim_public_key=?, smtp_account=?, smtp_password=? WHERE id=?`,
+		dkimPub, v.Username, v.Password, vpsID)
+
+	if aliyunDNS != nil {
+		rrs := DNSRRsForSubdomain(subdomain)
+		mxPriority := 10
+		records := []dns.DnsRecordSpec{
+			{RR: rrs.DKIM, RecordType: "TXT", Value: fmt.Sprintf("v=DKIM1; k=rsa; p=%s", dkimPub)},
+			{RR: rrs.MX, RecordType: "MX", Value: fqdn, Priority: &mxPriority},
+			{RR: rrs.SPF, RecordType: "TXT", Value: fmt.Sprintf("v=spf1 ip4:%s -all", ip)},
+			{RR: rrs.DMARC, RecordType: "TXT", Value: fmt.Sprintf("v=DMARC1; p=reject; rua=mailto:dmarc@%s", domain)},
+			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→server_ip
+			{RR: "smtp", RecordType: "A", Value: ip},
+		}
+		for _, spec := range records {
+			if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliyunDNS, aliyunCredID, domain, vpsID, spec, log); err != nil {
+				log("WARN", "UpsertRecord %s/%s 失败: %v", spec.RR, spec.RecordType, err)
+			}
+		}
+	}
+
+	// 单 NIC 反向 DNS（与 KumoMTA 路径同一函数；nic0 真生效，nic1+ 假阳性会被检测）
+	autoSetPTRForSupportedNICs(ctx, db, vpsID, ip, fqdn, nil, log)
+
+	log("INFO", "✅ Postfix + OpenDKIM 部署完成。SMTP: smtp.%s:587 STARTTLS | 账号: %s | 密码: %s", domain, v.Username, v.Password)
+	return nil
+}
+
 func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
@@ -1618,6 +1775,8 @@ func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdom
 			// autodiscover / autoconfig 让邮件大师等客户端自动配置
 			{RR: "autodiscover", RecordType: "CNAME", Value: fqdn},
 			{RR: "autoconfig", RecordType: "CNAME", Value: fqdn},
+			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→server_ip
+			{RR: "smtp", RecordType: "A", Value: ip},
 		}
 		for _, spec := range records {
 			if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliyunDNS, aliyunCredID, domain, vpsID, spec, log); err != nil {

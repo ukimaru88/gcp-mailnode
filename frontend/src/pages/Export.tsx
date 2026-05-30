@@ -76,8 +76,12 @@ export default function Export() {
                       ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-200'
                       : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'
                   }`}>
-            <div className="font-medium text-sm">mail-toolkit 格式</div>
-            <div className="text-xs text-slate-500 mt-1 font-mono">fqdn----ip----root----password</div>
+            <div className="font-medium text-sm">mail-toolkit 格式（CSV）</div>
+            <div className="text-xs text-slate-500 mt-1 font-mono">domain,smtp_host,smtp_port,account,password,security</div>
+            <div className="text-xs text-slate-500 mt-1">
+              与 mail-toolkit ExportSmtpCsv 完全一致：host=<span className="font-mono text-slate-300">smtp.根域</span>，account=<span className="font-mono text-slate-300">info@根域</span>。
+              发件器靠 From 域名自动连 smtp.根域:587 (STARTTLS)。
+            </div>
           </button>
         </div>
 

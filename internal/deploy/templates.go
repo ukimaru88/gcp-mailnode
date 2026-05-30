@@ -79,12 +79,15 @@ func BuildDeployVarsMultiNIC(rootDomain, subdomain, bindIP string, sources []Sou
 		sources = []SourceSpec{{Name: "primary", IP: bindIP, EHLO: fqdn}}
 	}
 	return DeployVars{
-		FQDN:         fqdn,
-		RootDomain:   rootDomain,
-		Subdomain:    subdomain,
-		Selector:     DefaultSelector,
-		BindIP:       bindIP,
-		Username:     DefaultMailUser + "@" + fqdn,
+		FQDN:       fqdn,
+		RootDomain: rootDomain,
+		Subdomain:  subdomain,
+		Selector:   DefaultSelector,
+		BindIP:     bindIP,
+		// v0.2.6：账号统一用 RootDomain（与 mail-toolkit 约定一致：From=info@根域，
+		// 发件器靠根域自动找 smtp.根域）。之前 KumoMTA 路径用 info@fqdn 在 subdomain
+		// 非 @ 时会变成 info@mail.x，跟用户预期不一致。
+		Username:     DefaultMailUser + "@" + rootDomain,
 		Password:     GenerateMailPassword(rootDomain),
 		SourcesBlock: BuildSourcesBlock(sources),
 	}
@@ -204,6 +207,12 @@ func RenderPolicyRouting(nicCount int) (string, error) {
 // RenderInstallMailcow 渲染 mailcow 安装脚本（收发一体）
 func RenderInstallMailcow(v DeployVars) (string, error) {
 	return render("templates/install_mailcow.sh", v)
+}
+
+// RenderInstallPostfix 渲染 Postfix + OpenDKIM 一站式部署脚本（纯发信，与 mail-toolkit 同源）
+// 脚本末尾打印 DKIM_PUBLIC_KEY=... 单行 base64，调用方用 extractDKIMPublicKey 捕获
+func RenderInstallPostfix(v DeployVars) (string, error) {
+	return render("templates/install_postfix.sh", v)
 }
 
 // RenderDkimSetup 渲染 DKIM 生成脚本

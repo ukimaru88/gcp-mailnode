@@ -72,6 +72,7 @@ export namespace deploy {
 	    ip_prefix_filter: string[];
 	    ip_prefix_exclude: string[];
 	    nic_count: number;
+	    skip_dnsbl: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new StageARequest(source);
@@ -88,6 +89,7 @@ export namespace deploy {
 	        this.ip_prefix_filter = source["ip_prefix_filter"];
 	        this.ip_prefix_exclude = source["ip_prefix_exclude"];
 	        this.nic_count = source["nic_count"];
+	        this.skip_dnsbl = source["skip_dnsbl"];
 	    }
 	}
 	export class StageBRequest {

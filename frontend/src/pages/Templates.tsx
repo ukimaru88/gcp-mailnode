@@ -47,7 +47,7 @@ const emptyForm = (): FormState => ({
   name: '',
   regions: [],
   auto_spread: true,
-  machine_type: 'e2-standard-2',
+  machine_type: 'e2-micro',
   image_family: 'ubuntu-2204-lts',
   image_project: 'ubuntu-os-cloud',
   disk_size_gb: 20,
@@ -186,7 +186,8 @@ export default function Templates() {
                   <td className="px-3 py-2 text-slate-200">{t.name}</td>
                   <td className="px-3 py-2 text-xs">
                     {dt === 'mailcow' ? <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300">📥 收发</span>
-                                      : <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">🚀 发信</span>}
+                                      : dt === 'postfix' ? <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">📬 Postfix</span>
+                                      : <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">🚀 KumoMTA</span>}
                   </td>
                   <td className="px-3 py-2 text-slate-300 text-xs">{(t.regions || []).join(', ') || '-'}{t.auto_spread && <span className="ml-1 text-indigo-400">(自动分配)</span>}</td>
                   <td className="px-3 py-2 text-slate-300 font-mono text-xs">{t.machine_type}</td>
@@ -286,11 +287,14 @@ export default function Templates() {
                 <label className="block text-xs text-slate-400 mb-1">部署类型</label>
                 <select className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none" value={form.deploy_type} onChange={e => setForm({ ...form, deploy_type: e.target.value })}>
                   <option value="kumomta">KumoMTA（纯发信，高并发，内存占用小）</option>
+                  <option value="postfix">Postfix + OpenDKIM（纯发信，经典稳定，与 mail-toolkit 同源）</option>
                   <option value="mailcow">mailcow（收发一体，Web UI + IMAP/SMTP，邮件大师可登录）</option>
                 </select>
                 <p className="text-[10px] text-slate-500 mt-0.5">
                   {form.deploy_type === 'mailcow'
                     ? '建议 4GB+ 内存；禁用 ClamAV 节省 2GB；部署后通过 https://{FQDN}/ 管理，默认 admin/moohoo'
+                    : form.deploy_type === 'postfix'
+                    ? 'Postfix + OpenDKIM 纯发信；25/587/465/2525 全开，SASL 鉴权；单 NIC 模式'
                     : 'KumoMTA 仅发信不收信；想收回信请改选 mailcow'}
                 </p>
               </div>
