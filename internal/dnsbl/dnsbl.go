@@ -110,10 +110,15 @@ func reverseIPv4(ip net.IP) (string, bool) {
 func queryZone(ctx context.Context, reversed string, zone Zone) ZoneResult {
 	qname := reversed + "." + zone.Host
 	var r net.Resolver
-	_, err := r.LookupHost(ctx, qname)
+	addrs, err := r.LookupHost(ctx, qname)
 	res := ZoneResult{Zone: zone}
 	if err == nil {
-		res.Hit = true
+		// v0.2.9：不再"只要能解析就判命中"。DNSBL 的"列入"返回码必须落在 127.0.0.0/8，
+		// 且要排除 127.255.255.0/24 —— 多数 RBL（如 Spamhaus）用这段表示查询错误/超限/
+		// 未授权的软拒绝应答；旧逻辑会把这种过载应答误判为命中，导致干净 IP 被丢弃。
+		if dnsblListedHit(addrs) {
+			res.Hit = true
+		}
 		return res
 	}
 	var dnsErr *net.DNSError
@@ -123,6 +128,23 @@ func queryZone(ctx context.Context, reversed string, zone Zone) ZoneResult {
 	}
 	res.Err = err
 	return res
+}
+
+// dnsblListedHit 判断 DNSBL 返回的 A 记录是否为真正的"列入"应答：必须在 127.0.0.0/8，
+// 且排除 127.255.255.0/24（RBL 普遍用作错误/超限/未授权返回码）。任一返回地址满足即命中。
+func dnsblListedHit(addrs []string) bool {
+	for _, a := range addrs {
+		ip := net.ParseIP(a).To4()
+		if ip == nil || ip[0] != 127 {
+			continue
+		}
+		if ip[1] == 255 && ip[2] == 255 {
+			// 127.255.255.x：错误/超限/未授权码，非真实列入
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Query 对一个 IPv4 并行查询所有 zone。

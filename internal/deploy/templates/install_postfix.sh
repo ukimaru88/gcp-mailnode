@@ -388,13 +388,16 @@ log_info "OpenDKIM installed and configured"
 # ============================================================
 # Phase 5: 创建邮箱用户
 # ============================================================
-log_info "Creating mail user: ${MAIL_USER}"
+log_info "Creating mail user: ${MAIL_USER} (nologin, 无系统登录密码)"
+# v0.2.9：SMTP AUTH 走 Cyrus SASL sasldb（见 Phase 2 saslpasswd2），本地系统账号仅用于
+# Maildir 兜底路径，不需要可登录。改 nologin 且不再 chpasswd（系统账号无密码），缩小攻击面
+# ——避免纯发信节点暴露一个可密码登录的系统账号。
 if id "${MAIL_USER}" &>/dev/null; then
-    log_info "User ${MAIL_USER} already exists, updating password"
+    log_info "User ${MAIL_USER} already exists, ensuring nologin"
+    usermod -s /usr/sbin/nologin "${MAIL_USER}" 2>/dev/null || true
 else
-    useradd -m -s /bin/bash "${MAIL_USER}"
+    useradd -m -s /usr/sbin/nologin "${MAIL_USER}"
 fi
-echo "${MAIL_USER}:${MAIL_PASS}" | chpasswd
 mkdir -p /home/${MAIL_USER}/Maildir
 chown -R ${MAIL_USER}:${MAIL_USER} /home/${MAIL_USER}/Maildir
 log_info "Mail user created"

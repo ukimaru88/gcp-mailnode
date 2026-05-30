@@ -465,6 +465,17 @@ func (a *App) BatchDelete(resourceType string, ids []string) (int, error) {
 //	"smtp_v3"   → ip:port:user:pass:persona_type:hide_ip:unsub_url:unsub_secret（v0.1.74+，含一键退订）
 //	"toolkit"   → CSV with header: domain,smtp_host,smtp_port,account,password,security
 //	              （v0.2.5：与 mail-toolkit ExportSmtpCsv 完全一致；可直接合并两边的 CSV）
+// csvField 按 RFC4180 转义 toolkit CSV 的单个字段：含 , " CR LF 时整体加双引号并把
+// 内部 " 转义成 ""。当前账号/密码为 info@域 + [A-Za-z0-9] 密码、域名为 LDH，本不含特殊
+// 字符（输出与旧版逐字节一致，不破坏 mail-toolkit 现有兼容）；此为防御性转义，仅在未来
+// 字段含分隔符时生效，避免密码/域名里的逗号把 CSV 列冲乱。
+func csvField(s string) string {
+	if strings.ContainsAny(s, ",\"\r\n") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
+}
+
 func (a *App) ExportSMTP(format string) (string, error) {
 	db, err := requireDB()
 	if err != nil {
@@ -512,8 +523,10 @@ func (a *App) ExportSMTP(format string) (string, error) {
 			} else if account != "" {
 				account = account + "@" + domain
 			}
-			lines = append(lines, fmt.Sprintf("%s,smtp.%s,587,%s,%s,STARTTLS",
-				domain, domain, account, pass))
+			lines = append(lines, strings.Join([]string{
+				csvField(domain), csvField("smtp." + domain), "587",
+				csvField(account), csvField(pass), "STARTTLS",
+			}, ","))
 		case "smtp_v2":
 			lines = append(lines, fmt.Sprintf("%s:587:%s:%s:%s:%d", ip, acct, pass, personaType, hideIP))
 		case "smtp_v3":

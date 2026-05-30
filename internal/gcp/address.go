@@ -7,14 +7,12 @@ import (
 	"strings"
 	"time"
 
-	compute "cloud.google.com/go/compute/apiv1"
 	"cloud.google.com/go/compute/apiv1/computepb"
 
 	"gcp-mailnode/internal/logger"
 
 	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -35,11 +33,10 @@ func (c *Client) ReserveStaticAddress(ctx context.Context, region, name string) 
 	if c.projectID == "" {
 		return AddressInfo{}, fmt.Errorf("projectID 为空")
 	}
-	cli, err := compute.NewAddressesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.addresses(ctx)
 	if err != nil {
 		return AddressInfo{}, fmt.Errorf("构造 Addresses client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	if name == "" {
 		u := uuid.NewString()
@@ -61,6 +58,9 @@ func (c *Client) ReserveStaticAddress(ctx context.Context, region, name string) 
 		return AddressInfo{}, fmt.Errorf("Insert Address 失败: %w", err)
 	}
 	if err := op.Wait(ctx); err != nil {
+		// v0.2.9：Insert 已提交，IP 可能已预留成功——Wait 失败（含 ctx 取消）不释放会留孤儿 IP 计费。
+		// best-effort 释放，用 background ctx 避免取消时释放不掉。
+		_ = c.ReleaseStaticAddress(context.Background(), region, name)
 		return AddressInfo{}, fmt.Errorf("等待 Insert Address 操作完成失败: %w", err)
 	}
 
@@ -74,11 +74,10 @@ func (c *Client) ReserveStaticAddress(ctx context.Context, region, name string) 
 
 // GetAddress 获取指定 region 下某个 Address 的详情
 func (c *Client) GetAddress(ctx context.Context, region, name string) (AddressInfo, error) {
-	cli, err := compute.NewAddressesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.addresses(ctx)
 	if err != nil {
 		return AddressInfo{}, fmt.Errorf("构造 Addresses client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	addr, err := cli.Get(ctx, &computepb.GetAddressRequest{
 		Project: c.projectID,
@@ -93,11 +92,10 @@ func (c *Client) GetAddress(ctx context.Context, region, name string) (AddressIn
 
 // ReleaseStaticAddress 释放静态 IP
 func (c *Client) ReleaseStaticAddress(ctx context.Context, region, name string) error {
-	cli, err := compute.NewAddressesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.addresses(ctx)
 	if err != nil {
 		return fmt.Errorf("构造 Addresses client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	logger.Info("GCP ReleaseStaticAddress name=%s region=%s", name, region)
 	op, err := cli.Delete(ctx, &computepb.DeleteAddressRequest{
@@ -117,11 +115,10 @@ func (c *Client) ReleaseStaticAddress(ctx context.Context, region, name string) 
 
 // ListAddresses 列出指定 region 下所有 Address
 func (c *Client) ListAddresses(ctx context.Context, region string) ([]AddressInfo, error) {
-	cli, err := compute.NewAddressesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.addresses(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("构造 Addresses client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	it := cli.List(ctx, &computepb.ListAddressesRequest{
 		Project: c.projectID,

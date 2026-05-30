@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -118,19 +119,33 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 	// 旧 batch_id 隔离了。把它们 reparent 到新 batch 后，剩下只需要补 (Count - 继承数) 个。
 	// 同时把 state.succeeded 预填为继承数量，让"目标达到"判断和 UI 计数正确。
 	// 多 NIC 的分组（slot_group）会在 Stage A 结束时由 groupCleanIPs 按当前 NICCount 重算，无需在这里处理。
+	// v0.2.9：限定只过继本次 GCP 凭据下的 clean IP。静态 IP 与账号绑定，把别的账号
+	// 预留的 IP 过继到本 batch 既用不了，又会把另一个并发批次的 IP 抢走（审计发现）。
+	reparentArgs := []interface{}{batchID, batchID}
+	credIn := ""
+	if len(req.GCPCredIDs) > 0 {
+		credIn = " AND gcp_cred_id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(req.GCPCredIDs)), ",") + ")"
+		for _, c := range req.GCPCredIDs {
+			reparentArgs = append(reparentArgs, c)
+		}
+	}
 	if res, err := db.ExecContext(ctx,
-		`UPDATE static_ips
-		    SET batch_id=?, slot_group=''
-		  WHERE batch_id<>? AND status='clean' AND bound_instance_id=''`,
-		batchID, batchID); err == nil {
+		`UPDATE static_ips SET batch_id=?, slot_group='' WHERE batch_id<>? AND status='clean' AND bound_instance_id=''`+credIn,
+		reparentArgs...); err == nil {
 		if inherited, _ := res.RowsAffected(); inherited > 0 {
-			atomic.StoreInt64(&state.succeeded, inherited)
+			// v0.2.9：clamp 到 req.Count。继承数可能超过本次目标（上次筛多了），succeeded 不能
+			// 虚高于 total，否则 UI 进度 >100% 且 claimSlot 的"达到 N 即停"语义错乱。
+			preset := inherited
+			if preset > int64(req.Count) {
+				preset = int64(req.Count)
+			}
+			atomic.StoreInt64(&state.succeeded, preset)
 			remaining := int64(req.Count) - inherited
 			if remaining < 0 {
 				remaining = 0
 			}
 			onLog(batchID, 0, "INFO",
-				fmt.Sprintf("继承上次未用的 clean IP %d 个，目标 %d，本次仍需筛选 %d 个",
+				fmt.Sprintf("继承本账号上次未用的 clean IP %d 个，目标 %d，本次仍需筛选 %d 个",
 					inherited, req.Count, remaining))
 		}
 	}
@@ -381,21 +396,25 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 		return err
 	}
 	ipID := uuid.NewString()
-	_, _ = db.ExecContext(ctx,
+	// v0.2.9：IP 已在 GCP 端 reserve 成功，后续"落库 + 释放"必须脱离 runCtx 取消——否则用户
+	// 取消 Stage A 时：落库失败会留下无本地记录的 GCP 孤儿 IP；release 被取消打断则 IP 漏释放。
+	// 两种都让静态 IP 持续计费。persistCtx 用 background 保证这些善后操作一定执行。
+	persistCtx := context.Background()
+	_, _ = db.ExecContext(persistCtx,
 		`INSERT INTO static_ips (id, gcp_cred_id, gcp_address_name, ip, region, status, batch_id) VALUES (?,?,?,?,?,?,?)`,
 		ipID, gcpCredID, addr.Name, addr.IP, region, "reserved", batchID)
 
 	// release 立即释放（用于 target_reached / DNSBL 检测错误等不算"脏"的情形）
 	release := func(status, result, hitLists string) {
-		_, _ = db.ExecContext(ctx,
+		_, _ = db.ExecContext(persistCtx,
 			`UPDATE static_ips SET status=?, dnsbl_result=?, dnsbl_hit_lists=?, bound_instance_id='' WHERE id=?`,
 			status, result, hitLists, ipID)
-		_ = gcpClient.ReleaseStaticAddress(ctx, region, addr.Name)
+		_ = gcpClient.ReleaseStaticAddress(persistCtx, region, addr.Name)
 	}
 	// holdDirty 暂存脏 IP（前缀/黑段/DNSBL 判脏），攒够 dirtyIPHolder.holdThreshold 个一次释放。
 	// 目的：避免 release-then-reserve 立刻抽到同一批脏 IP；让 GCP 把池子真正翻一遍。
 	holdDirty := func(result, hitLists string) {
-		_, _ = db.ExecContext(ctx,
+		_, _ = db.ExecContext(persistCtx,
 			`UPDATE static_ips SET status='dirty', dnsbl_result=?, dnsbl_hit_lists=?, bound_instance_id='' WHERE id=?`,
 			result, hitLists, ipID)
 		if dirty != nil {
@@ -406,7 +425,7 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 				region:    region,
 				gcpClient: gcpClient,
 				reserveAt: time.Now(),
-			}, ctx, db, log)
+			}, persistCtx, db, log)
 		} else {
 			// holder 为 nil（兼容路径）：回退到立即释放
 			release("released", result, hitLists)
@@ -1537,7 +1556,11 @@ func autoSetPTRForSupportedNICs(ctx context.Context, db *sql.DB, vpsID, ip, fqdn
 	if err := cli.SetInstancePTRForNIC(ctx, zone, instanceName, 0, ip, fqdn); err != nil {
 		nic0OK = false
 		_, _ = db.Exec(`UPDATE vps_instances SET ptr_status='failed' WHERE id=?`, vpsID)
-		log("WARN", "auto-PTR nic0 失败（可走 Stage D 重试）: %v", err)
+		if errors.Is(err, gcp.ErrPTRNATLost) {
+			log("ERROR", "🔴 auto-PTR nic0 失败且原公网 NAT 未能恢复——VPS %s 可能已失去外网 IP，需在 GCP 控制台/资源页手动重建 External NAT: %v", instanceName, err)
+		} else {
+			log("WARN", "auto-PTR nic0 失败（可走 Stage D 重试）: %v", err)
+		}
 	}
 
 	// nic1~nicN: mail{N+1}.<rootDomain> -> additional IP
@@ -1560,12 +1583,17 @@ func autoSetPTRForSupportedNICs(ctx context.Context, db *sql.DB, vpsID, ip, fqdn
 		nicFQDN := fmt.Sprintf("mail%d.%s", nicIdx+1, rootDomain)
 		log("INFO", "auto-PTR nic%d: %s -> %s", nicIdx, e.IP, nicFQDN)
 		if err := cli.SetInstancePTRForNIC(ctx, zone, instanceName, nicIdx, e.IP, nicFQDN); err != nil {
-			log("WARN", "auto-PTR nic%d API 失败（不阻塞，可在资源页批量重设）: %v", nicIdx, err)
+			if errors.Is(err, gcp.ErrPTRNATLost) {
+				log("ERROR", "🔴 auto-PTR nic%d 失败且原公网 NAT 未恢复——该 NIC (%s) 已失去外网出口，需在资源页重建 External NAT: %v", nicIdx, e.IP, err)
+			} else {
+				log("WARN", "auto-PTR nic%d API 失败（不阻塞，可在资源页批量重设）: %v", nicIdx, err)
+			}
 			continue
 		}
 		// v0.1.75：反向 DNS 校验。GCP API 对 nic1~7 经常 silent ignore，必须 dig -x 验证才知道是不是真生效。
-		// 5 次重试，间隔 6 秒（PTR 传播一般 < 30 秒）。校验失败记 silentIgnore，UI 用 partial 让用户知道。
-		if verifyReversePTR(ctx, e.IP, nicFQDN, 5, 6*time.Second) {
+		// v0.2.9：窗口从 5×6s=30s 放宽到 10×15s=150s。GCP PTR 传播常 30-120s，30s 太短会把"慢一拍
+		// 但会真生效"的 NIC 误判成 silent ignore（partial 假警报）。校验失败才记 silentIgnore。
+		if verifyReversePTR(ctx, e.IP, nicFQDN, 10, 15*time.Second) {
 			successCount++
 		} else {
 			silentIgnoreCount++

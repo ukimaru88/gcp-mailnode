@@ -56,6 +56,43 @@ type Client struct {
 	cred        Credential
 	projectID   string
 	tokenSource oauth2.TokenSource
+
+	// v0.2.9：缓存高频 REST client（Instances/Addresses），避免每次 Create/Get/Delete/Reserve/
+	// Release 都新建 client —— 100+ 台批量时短时大量 TLS 连接可能撞 ephemeral port 上限。
+	// google cloud client 并发安全，可被多 worker 共享；懒加载，Close 时统一关。
+	mu           sync.Mutex
+	instancesCli *compute.InstancesClient
+	addressesCli *compute.AddressesClient
+}
+
+// instances 返回缓存的 Instances REST client（懒加载）。
+func (c *Client) instances(ctx context.Context) (*compute.InstancesClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.instancesCli != nil {
+		return c.instancesCli, nil
+	}
+	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	if err != nil {
+		return nil, err
+	}
+	c.instancesCli = cli
+	return cli, nil
+}
+
+// addresses 返回缓存的 Addresses REST client（懒加载）。
+func (c *Client) addresses(ctx context.Context) (*compute.AddressesClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.addressesCli != nil {
+		return c.addressesCli, nil
+	}
+	cli, err := compute.NewAddressesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	if err != nil {
+		return nil, err
+	}
+	c.addressesCli = cli
+	return cli, nil
 }
 
 // NewClient 根据凭据构造 Client
@@ -156,7 +193,10 @@ func (s *gcloudTokenSource) Token() (*oauth2.Token, error) {
 	return &oauth2.Token{
 		AccessToken: accessToken,
 		TokenType:   "Bearer",
-		Expiry:      time.Now().Add(50 * time.Minute),
+		// gcloud print-access-token 不返回真实过期时间，且可能返回缓存里临近过期的 token。
+		// 保守标 10 分钟（而非乐观的 50 分钟）：配合 ReuseTokenSource 更频繁刷新，避免长批量
+		// 任务中途用到已过期 token 触发 401。代价是每 ~10 分钟多 exec 一次 gcloud，可忽略。
+		Expiry: time.Now().Add(10 * time.Minute),
 	}, nil
 }
 
@@ -190,7 +230,19 @@ func (c *Client) TestConnection(ctx context.Context) error {
 }
 
 // Close 释放资源（当前无持有长连接）
-func (c *Client) Close() error { return nil }
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.instancesCli != nil {
+		_ = c.instancesCli.Close()
+		c.instancesCli = nil
+	}
+	if c.addressesCli != nil {
+		_ = c.addressesCli.Close()
+		c.addressesCli = nil
+	}
+	return nil
+}
 
 // CheckADCAvailable 检查本机 ADC 凭证是否可用。返回 ADC 找到的 projectID（可能为空）。
 // 本方法不会访问网络，仅确认凭证文件能被解析 + 从 gcloud 读默认 project。

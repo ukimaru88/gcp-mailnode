@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.8**（`version.txt`；代码已含 P0 + 3 项安全/正确性修复，exe 待 `bash build.sh` 打包）
+> 当前版本：**v0.2.9**（`version.txt`；P0 + 审核全部待办已修并打包出 exe）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.8**（待打包） | 最新。安全 + 正确性修复：① **P0 开放中继**（`GenerateMailPassword` 空时回退随机 20 位 [A-Za-z0-9] 密码）② **域名注入**（`render()` 单点 LDH 白名单校验，堵 shell+Lua）③ **配额自愈失效**（`IsQuotaExceeded` 改 `contains(quota)&&contains(exceeded)`，识别 GCP 真实配额 message）④ **OAuth 无超时**（`cfg.Exchange` 改用 timeoutCtx）⑤ 修审计 P1-1 失效测试断言（全部加防回归测试）⑥ **预设模板统一只留 e2-micro**：删 e2-small/e2-medium 预设、软隐藏旧预设；新建模板默认机型仍 e2-micro，前端下拉保留多档供手动选 |
+| **v0.2.9** | 最新。修复审核出的全部待办：① Postfix 系统账号改 nologin、不再 chpasswd（缩攻击面）② clean IP 过继限定本账号 + succeeded clamp 到 Count ③ Stage A 取消时 reserve 后的落库/释放改 background ctx（防孤儿 IP/漏释放）④ PTR 校验窗口 30s→150s + 失 NAT 哨兵错误 `ErrPTRNATLost`（nic0/nic1+ ERROR 告警）⑤ GCP Create/Reserve 的 Wait 失败 best-effort 清孤儿 ⑥ gcloud token 过期 50min→10min ⑦ **GCP Instances/Addresses client 缓存复用**（防 100+ 台撞 ephemeral port）⑧ DNSBL 命中校验 127/8 且排除 127.255.255.0/24 软拒绝码 ⑨ CSV 导出 RFC4180 转义。curl 兜底/systemd 持久化经核实早已实现。新增 dnsbl/errors/域名注入回归测试 |
+| v0.2.8 | 安全 + 正确性修复：① **P0 开放中继**（`GenerateMailPassword` 空时回退随机 20 位 [A-Za-z0-9] 密码）② **域名注入**（`render()` 单点 LDH 白名单校验，堵 shell+Lua）③ **配额自愈失效**（`IsQuotaExceeded` 改 `contains(quota)&&contains(exceeded)`，识别 GCP 真实配额 message）④ **OAuth 无超时**（`cfg.Exchange` 改用 timeoutCtx）⑤ 修审计 P1-1 失效测试断言（全部加防回归测试）⑥ **预设模板统一只留 e2-micro**：删 e2-small/e2-medium 预设、软隐藏旧预设；新建模板默认机型仍 e2-micro，前端下拉保留多档供手动选 |
 | v0.2.7 | SMTP 导出格式全栈对齐 mail-toolkit 约定：账号统一 `info@根域`、SMTP host=`smtp.根域`、部署时自动加 `smtp` 子域 A 记录、Postfix 改 Cyrus SASL **sasldb 后端**、CSV 导出归一化（`domain,smtp_host,smtp_port,account,password,security`）。⚠️ 老 KumoMTA VPS 要重跑 Stage C 重渲 smtp_auth.lua 才认新账号 |
 | v0.2.6 | SMTP 导出格式第一次修（不完整，仍用 fqdn 做 host），被 v0.2.7 全栈对齐取代 |
 | v0.2.5 | 加「跳过 DNSBL 检测」开关（StageARequest.SkipDNSBL）：仅前缀过滤，20 IP 从 100-200s 缩到 20-40s；UI 黄色 checkbox 默认关 |
@@ -189,35 +190,33 @@ D:\gcp-mailnode\
 
 ## 11. 待办
 
-> 本节随 2026-05-30「修 P0 + 4 Agent 全量审核」更新。✅ = 本次已修（代码已改、测试已加，待 `bash build.sh` 打包成 v0.2.8）。
+> 本节随 2026-05-30「修 P0 + 4 Agent 全量审核 + 修全部待办」更新。审核出的**代码问题已全部修复**（v0.2.8 + v0.2.9），剩下只有需真机环境才能推进的项。
 
-### ✅ 本次已修（2026-05-30，代码已含，待打包 v0.2.8）
-- **P0 开放中继 + 空密码系统账号**：`GenerateMailPassword` 空时回退随机 20 位 `[A-Za-z0-9]` 密码（[templates.go](internal/deploy/templates.go)），KumoMTA `smtp_auth.lua` / Postfix `saslpasswd2`+`chpasswd` / 落库 / CSV 全链路一致；字符集纯字母数字同时规避了 CSV/smtp_v2 分隔符打穿。加 `TestGenerateMailPassword_NeverEmpty` + `TestRenderSmtpAuthLua_NoEmptyPassword` 防回归。
-- **域名注入（P0 的另一半）**：`render()` 单点加 `validateDeployDomains`，FQDN/RootDomain/Subdomain 仅允许 LDH（`[A-Za-z0-9.-]`），堵死经畸形域名注入 root shell（`hostnamectl` / `opendkim-genkey -d`）与 KumoMTA Lua 单引号字符串两条路径。加 `TestRender_RejectsInjectionDomain`。
-- **配额自愈失效**：`IsQuotaExceeded`（[gcp/errors.go](internal/gcp/errors.go)）字符串兜底改 `contains("quota") && contains("exceeded")`，能识别 GCP compute/apiv1 真实 message `Quota 'STATIC_ADDRESSES' exceeded.`（旧的 `quota_exceeded`/`quota exceeded` 匹配不到 → region 软冷却/让额逻辑全失效）；`IsNotFound` 补 `not found`。加 `errors_test.go`。
-- **OAuth token 交换无超时**：`cfg.Exchange` 改用 5min `timeoutCtx`（[gcp/client.go](internal/gcp/client.go)），防 token endpoint 卡死无限阻塞。
-- **审计 P1-1 失效测试**：`get_egress_path_config` 断言改用 `containsActiveLuaCall` 跳注释 + 语义倒转（v0.1.85 后不应再注册该 hook）。
+### ✅ v0.2.8 已修（安全 4 项）
+- **P0 开放中继 + 空密码系统账号**：`GenerateMailPassword` 空时回退随机 20 位 `[A-Za-z0-9]` 密码，KumoMTA/Postfix/chpasswd/CSV 全链路一致（字符集纯字母数字也规避了 CSV 分隔符打穿）。
+- **域名注入（P0 另一半）**：`render()` 单点 `validateDeployDomains` LDH 白名单，堵 shell + Lua 两条路径。
+- **配额自愈失效**：`IsQuotaExceeded` 改 `contains("quota")&&contains("exceeded")`，识别 GCP 真实 `Quota '...' exceeded.`；`IsNotFound` 补 `not found`。
+- **OAuth 无超时**：`cfg.Exchange` 改用 `timeoutCtx`。
+- 顺手修审计 P1-1 失效测试断言（`get_egress_path_config`）。
 
-### 待办（本轮审核新发现，未修，确凿度见括注）
-- **Postfix 冗余系统账号（确凿，缩攻击面）**：install_postfix.sh `chpasswd` 给 `info` 设可登录系统账号，但 SASL 走 sasldb 根本不用它。建议 `usermod -s /usr/sbin/nologin` 或删 useradd。
-- **clean IP 过继计数错位（确凿计数 / 并发抢 IP 需验证）**：stages.go 过继老 batch clean IP 时 `succeeded` 预填可能虚高；reparent 的 WHERE 不限 region/cred，并发跑两个 Stage A 会互抢 clean IP。建议 reparent 限定本次 cred/region 且 succeeded clamp 到 req.Count。
-- **PTR nic1-7 可能静默失公网 NAT（需验证）**：`SetInstancePTRForNIC` 在 Delete 成功+Add 失败+restore 失败时该 NIC 掉外网，调用方只 WARN 不重建 AccessConfig。
-- **GCP Insert 成功+Wait 失败不清理孤儿（需验证）**：compute.go/address.go 的 CreateInstance/ReserveStaticAddress 在 Wait 失败时不删半成品，孤儿 VM/静态 IP 持续计费（与 P2-1 同源但更底层）。
-- **CSV 导出零转义（当前已被规避）**：app_resource.go 导出直接拼接，靠密码 `[A-Za-z0-9]` + 合法域名规避；若未来放宽密码字符集需补 `csv.Writer`/转义，且要与 mail-toolkit 用同一套规则。
-- **DNSBL 软拒绝误判（需验证）**：dnsbl.go 把 RBL 返回的"过载占位地址"也当命中，阈值=1 放大，可能误丢干净 IP。建议校验返回 A 记录是否落在该 RBL 有效返回码范围。
-- **gcloud token 50min 硬编码过期（需验证）**：client.go `gcloudTokenSource` 固定标 50min，可能用到已过期 token，建议取短或解析真实 exp（AuthGcloudCLI 是兼容路径，影响有限）。
+### ✅ v0.2.9 已修（审核出的全部待办）
+- **Postfix 冗余系统账号**：[install_postfix.sh](internal/deploy/templates/install_postfix.sh) `info` 改 `nologin`、不再 `chpasswd`（SASL 走 sasldb 不需要可登录账号）。
+- **clean IP 过继计数错位**：[stages.go](internal/deploy/stages.go) reparent 限定本账号 `gcp_cred_id` + `succeeded` clamp 到 `req.Count`。
+- **Stage A 取消漏释放**：reserve 成功后落库/release/holdDirty 改 `context.Background()`（`persistCtx`），防取消时留孤儿 IP / 漏释放。
+- **PTR**：`verifyReversePTR` 窗口 30s→150s（10×15s）；新增哨兵 `gcp.ErrPTRNATLost`，nic0/nic1+ 失 NAT 时 ERROR 告警提示手动重建 External NAT。
+- **GCP Wait 失败清孤儿**：CreateInstance / ReserveStaticAddress 的 `op.Wait` 失败 best-effort 删 VM / 释放 IP（background ctx）。
+- **GCP client 复用**：[client.go](internal/gcp/client.go) Client 缓存 Instances/Addresses REST client（懒加载 + Close 统一关），11 处调用点改用缓存，防 100+ 台撞 ephemeral port。
+- **gcloud token**：过期标记 50min→10min（防用到已过期 token）。
+- **DNSBL 软拒绝误判**：[dnsbl.go](internal/dnsbl/dnsbl.go) 命中校验返回 A 记录在 127/8 且排除 127.255.255.0/24（RBL 错误/超限码）。
+- **CSV 导出转义**：[app_resource.go](app_resource.go) toolkit CSV 走 RFC4180 `csvField` 转义。
+- **curl 兜底 / systemd 持久化**：经 grep 核实**早已实现**——setup_policy_routing.sh 自装 curl + oneshot service 开机恢复路由；deploy_config.sh `systemctl enable kumomta`；install_postfix.sh enable postfix/opendkim。属文档误列，非真待办。
+- 新增回归测试：`dnsbl_test.go` / `errors_test.go` / `TestRender_RejectsInjectionDomain` / `TestGenerateMailPassword_NeverEmpty` 等，`go test ./...` 全绿。
 
-### 历史待办（审计 2026-05-23，仍未修）
-- **P1-3' PTR 校验窗口太短**：`verifyReversePTR` 30s（5×6s）< GCP 传播 30-120s，误判 partial。建议 10×15s。
-- **P2-1 Stage A 取消漏释放 in-flight IP**：取消时 reserve→DNSBL 之间的 IP 不进 dirty 也不释放，GCP 静态 IP 继续计费。
-- **P2-2 GCP client 未复用**：每次 Create/Get/Delete 新建 REST client，100+ 台批量可能撞 ephemeral port 上限。建议 Client 结构体缓存各 client。
-- systemd 持久化 KumoMTA 服务 / curl 兜底依赖（部分服务器没装 curl）/ auto-PTR 链路端到端验证。
+### 🔴 剩余（需真机环境才能推进）
+- **端到端实测（头号）**：v0.2.1→v0.2.9 大量改动从未真机跑过。开一台 e2-micro 跑 Postfix 全链路。易爆点：Ubuntu 22 `saslpasswd2` 依赖 `sasl2-bin`（已装）/ chroot 同步 `/var/spool/postfix/etc/sasldb2` 权限 / `smtp.根域` A 记录与 mailcow autodiscover 冲突 / auto-PTR 链路。
+- **老 KumoMTA VPS 升级**：brutal 用新 CSV 账号（`info@根域`）登老 VPS 需重跑 Stage C 重渲 `smtp_auth.lua`。
 
-### 🔴 头号风险（未变）
-- **端到端实测**：v0.2.1→v0.2.8 一堆改动（Postfix/sasldb/smtp.根域 A 记录/CSV 对齐 + 本次 4 项修复）**从未真机跑过**。开一台 e2-micro 跑 Postfix 全链路。易爆点：Ubuntu 22 `saslpasswd2` 依赖 `sasl2-bin`（已装）/ chroot 同步 `/var/spool/postfix/etc/sasldb2` 权限 / `smtp.根域` A 记录与 mailcow autodiscover 冲突。
-- **老 KumoMTA VPS 升级**：brutal 用新 CSV 账号（`info@根域`）登老 VPS，需重跑 Stage C 重渲 `smtp_auth.lua`。
-
-> 完整审计报告（2026-05-23，含已自我推翻的 P1-3/P1-4 与好实践清单）汇总入口在 `D:\CLAUDE_MEMORY\P1-P5-汇总执行清单-v2.md`；项目内临时副本 `AUDIT_2026-05-23.md` 已于 2026-05-30 删除（真问题已摘入本节）。
+> 完整审计报告（2026-05-23）汇总入口在 `D:\CLAUDE_MEMORY\P1-P5-汇总执行清单-v2.md`；项目内临时副本 `AUDIT_2026-05-23.md` 已于 2026-05-30 删除。
 
 ---
 

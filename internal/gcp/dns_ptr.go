@@ -2,6 +2,7 @@ package gcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	compute "cloud.google.com/go/compute/apiv1"
@@ -9,7 +10,6 @@ import (
 
 	"gcp-mailnode/internal/logger"
 
-	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -17,6 +17,11 @@ import (
 const (
 	defaultAccessConfigName = "External NAT"
 )
+
+// ErrPTRNATLost 表示设置 PTR 过程中：删除了原 External NAT、重建带 PTR 的 NAT 失败、
+// 且恢复原 NAT 也失败 —— 该 NIC 已彻底失去公网出口，需人工或上层重建 AccessConfig。
+// 调用方用 errors.Is(err, ErrPTRNATLost) 识别这种严重情形（区别于普通 PTR 设置失败）。
+var ErrPTRNATLost = errors.New("NIC 公网 NAT 已丢失（PTR 重建失败且恢复失败）")
 
 // nicNameFor 返回 GCP NetworkInterface 名（nic0、nic1、...）
 func nicNameFor(idx int) string {
@@ -40,11 +45,10 @@ func (c *Client) SetInstancePTRForNIC(ctx context.Context, zone, instanceName st
 	if c.projectID == "" {
 		return fmt.Errorf("projectID 为空")
 	}
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	// 1) 删掉默认 access config
 	logger.Info("GCP SetInstancePTR step1 删除 AccessConfig instance=%s", instanceName)
@@ -81,13 +85,13 @@ func (c *Client) SetInstancePTRForNIC(ctx context.Context, zone, instanceName st
 	addOp, err := cli.AddAccessConfig(ctx, addReq)
 	if err != nil {
 		if restoreErr := restoreAccessConfig(ctx, cli, c.projectID, zone, instanceName, nicIndex, ip); restoreErr != nil {
-			return fmt.Errorf("AddAccessConfig 失败: %w；恢复原公网 NAT 也失败: %v", err, restoreErr)
+			return fmt.Errorf("AddAccessConfig 失败: %v；恢复原公网 NAT 也失败: %v: %w", err, restoreErr, ErrPTRNATLost)
 		}
 		return fmt.Errorf("AddAccessConfig 失败，已恢复原公网 NAT: %w", err)
 	}
 	if err := addOp.Wait(ctx); err != nil {
 		if restoreErr := restoreAccessConfig(ctx, cli, c.projectID, zone, instanceName, nicIndex, ip); restoreErr != nil {
-			return fmt.Errorf("等待 AddAccessConfig 完成失败: %w；恢复原公网 NAT 也失败: %v", err, restoreErr)
+			return fmt.Errorf("等待 AddAccessConfig 完成失败: %v；恢复原公网 NAT 也失败: %v: %w", err, restoreErr, ErrPTRNATLost)
 		}
 		return fmt.Errorf("等待 AddAccessConfig 完成失败，已恢复原公网 NAT: %w", err)
 	}
@@ -121,11 +125,10 @@ func (c *Client) ClearInstancePTR(ctx context.Context, zone, instanceName, ip st
 	if c.projectID == "" {
 		return fmt.Errorf("projectID 为空")
 	}
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	logger.Info("GCP ClearInstancePTR step1 删除 AccessConfig instance=%s", instanceName)
 	delReq := &computepb.DeleteAccessConfigInstanceRequest{

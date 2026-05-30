@@ -7,13 +7,11 @@ import (
 	"strings"
 	"time"
 
-	compute "cloud.google.com/go/compute/apiv1"
 	"cloud.google.com/go/compute/apiv1/computepb"
 
 	"gcp-mailnode/internal/logger"
 
 	"google.golang.org/api/iterator"
-	"google.golang.org/api/option"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -71,11 +69,10 @@ func (c *Client) CreateInstance(ctx context.Context, spec InstanceSpec) (Instanc
 	if c.projectID == "" {
 		return InstanceInfo{}, fmt.Errorf("projectID 为空")
 	}
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return InstanceInfo{}, fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	network := spec.NetworkName
 	if network == "" {
@@ -149,6 +146,9 @@ func (c *Client) CreateInstance(ctx context.Context, spec InstanceSpec) (Instanc
 		return InstanceInfo{}, fmt.Errorf("Insert 实例失败: %w", err)
 	}
 	if err := op.Wait(ctx); err != nil {
+		// v0.2.9：Insert 已提交，实例可能已在创建——Wait 失败（含 ctx 取消）不删会留孤儿 VM 计费。
+		// best-effort 删除，用 background ctx 避免取消时删不掉。
+		_ = c.DeleteInstance(context.Background(), spec.Zone, spec.Name)
 		return InstanceInfo{}, fmt.Errorf("等待 Insert 操作完成失败: %w", err)
 	}
 
@@ -202,11 +202,10 @@ func buildNetworkInterfaces(spec InstanceSpec, defaultNetworkURL string) []*comp
 
 // GetInstance 获取实例详情
 func (c *Client) GetInstance(ctx context.Context, zone, name string) (InstanceInfo, error) {
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return InstanceInfo{}, fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	req := &computepb.GetInstanceRequest{
 		Project:  c.projectID,
@@ -222,11 +221,10 @@ func (c *Client) GetInstance(ctx context.Context, zone, name string) (InstanceIn
 
 // DeleteInstance 删除实例
 func (c *Client) DeleteInstance(ctx context.Context, zone, name string) error {
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	logger.Info("GCP DeleteInstance name=%s zone=%s", name, zone)
 	op, err := cli.Delete(ctx, &computepb.DeleteInstanceRequest{
@@ -246,11 +244,10 @@ func (c *Client) DeleteInstance(ctx context.Context, zone, name string) error {
 
 // ListInstances 列出指定 zone 下的所有实例
 func (c *Client) ListInstances(ctx context.Context, zone string) ([]InstanceInfo, error) {
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	req := &computepb.ListInstancesRequest{
 		Project: c.projectID,
@@ -349,11 +346,10 @@ func instanceToInfo(inst *computepb.Instance) InstanceInfo {
 // SetInstanceTags 补齐/覆盖 VM 的 network tags（用于修复漏打 mail-node 的机器）
 // 调用前必须 GetInstance 拿到 fingerprint。传 append=true 时保留现有 tags 并追加新 tag。
 func (c *Client) SetInstanceTags(ctx context.Context, zone, instanceName string, tags []string, fingerprint string) error {
-	cli, err := compute.NewInstancesRESTClient(ctx, option.WithTokenSource(c.tokenSource))
+	cli, err := c.instances(ctx)
 	if err != nil {
 		return fmt.Errorf("构造 Instances client 失败: %w", err)
 	}
-	defer cli.Close()
 
 	logger.Info("GCP SetInstanceTags name=%s zone=%s tags=%v", instanceName, zone, tags)
 	op, err := cli.SetTags(ctx, &computepb.SetTagsInstanceRequest{
