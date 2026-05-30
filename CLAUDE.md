@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.9**（`version.txt`；P0 + 审核全部待办已修并打包出 exe）
+> 当前版本：**v0.2.10**（`version.txt`；新增 toolkit `账号----密码` 导出格式 + 批量第三步可选搭建方式）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.9** | 最新。修复审核出的全部待办：① Postfix 系统账号改 nologin、不再 chpasswd（缩攻击面）② clean IP 过继限定本账号 + succeeded clamp 到 Count ③ Stage A 取消时 reserve 后的落库/释放改 background ctx（防孤儿 IP/漏释放）④ PTR 校验窗口 30s→150s + 失 NAT 哨兵错误 `ErrPTRNATLost`（nic0/nic1+ ERROR 告警）⑤ GCP Create/Reserve 的 Wait 失败 best-effort 清孤儿 ⑥ gcloud token 过期 50min→10min ⑦ **GCP Instances/Addresses client 缓存复用**（防 100+ 台撞 ephemeral port）⑧ DNSBL 命中校验 127/8 且排除 127.255.255.0/24 软拒绝码 ⑨ CSV 导出 RFC4180 转义。curl 兜底/systemd 持久化经核实早已实现。新增 dnsbl/errors/域名注入回归测试 |
+| **v0.2.10** | 最新。① 导出新增 `toolkit_short`（`info@根域----密码`，对齐 mail-toolkit 简短导出）+ `toolkit_full`（`账号----密码----host:port----security`）两种 `----` 格式，Export 页加按钮 ② **批量部署第三步加「搭建方式」选择**（跟随模板/KumoMTA/Postfix）：`StageCRequest.DeployType` + `DeployOpts.DeployType` 当场覆盖模板默认，多 NIC 自动回退 kumomta；Batch.tsx Stage C 弹窗加三选按钮 |
+| v0.2.9 | 修复审核出的全部待办：① Postfix 系统账号改 nologin、不再 chpasswd（缩攻击面）② clean IP 过继限定本账号 + succeeded clamp 到 Count ③ Stage A 取消时 reserve 后的落库/释放改 background ctx（防孤儿 IP/漏释放）④ PTR 校验窗口 30s→150s + 失 NAT 哨兵错误 `ErrPTRNATLost`（nic0/nic1+ ERROR 告警）⑤ GCP Create/Reserve 的 Wait 失败 best-effort 清孤儿 ⑥ gcloud token 过期 50min→10min ⑦ **GCP Instances/Addresses client 缓存复用**（防 100+ 台撞 ephemeral port）⑧ DNSBL 命中校验 127/8 且排除 127.255.255.0/24 软拒绝码 ⑨ CSV 导出 RFC4180 转义。curl 兜底/systemd 持久化经核实早已实现。新增 dnsbl/errors/域名注入回归测试 |
 | v0.2.8 | 安全 + 正确性修复：① **P0 开放中继**（`GenerateMailPassword` 空时回退随机 20 位 [A-Za-z0-9] 密码）② **域名注入**（`render()` 单点 LDH 白名单校验，堵 shell+Lua）③ **配额自愈失效**（`IsQuotaExceeded` 改 `contains(quota)&&contains(exceeded)`，识别 GCP 真实配额 message）④ **OAuth 无超时**（`cfg.Exchange` 改用 timeoutCtx）⑤ 修审计 P1-1 失效测试断言（全部加防回归测试）⑥ **预设模板统一只留 e2-micro**：删 e2-small/e2-medium 预设、软隐藏旧预设；新建模板默认机型仍 e2-micro，前端下拉保留多档供手动选 |
 | v0.2.7 | SMTP 导出格式全栈对齐 mail-toolkit 约定：账号统一 `info@根域`、SMTP host=`smtp.根域`、部署时自动加 `smtp` 子域 A 记录、Postfix 改 Cyrus SASL **sasldb 后端**、CSV 导出归一化（`domain,smtp_host,smtp_port,account,password,security`）。⚠️ 老 KumoMTA VPS 要重跑 Stage C 重渲 smtp_auth.lua 才认新账号 |
 | v0.2.6 | SMTP 导出格式第一次修（不完整，仍用 fqdn 做 host），被 v0.2.7 全栈对齐取代 |

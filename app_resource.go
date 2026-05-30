@@ -510,23 +510,30 @@ func (a *App) ExportSMTP(format string) (string, error) {
 		}
 		// personaName → brutal-mailer 的 persona_type 字面量
 		personaType := personaNameToBrutalType(personaName)
+		// toolkit 系格式统一用归一化账号 info@根域（从 smtp_account 取 @ 前缀重拼根域，
+		// 兼容老数据里的 info@fqdn）。smtp / smtp_v2 / smtp_v3 仍用原始 acct（ip:port:user 结构）。
+		_ = rootPwd
+		_ = fqdn
+		tkAccount := acct
+		if at := strings.LastIndex(tkAccount, "@"); at >= 0 {
+			tkAccount = tkAccount[:at] + "@" + domain
+		} else if tkAccount != "" {
+			tkAccount = tkAccount + "@" + domain
+		}
 		switch format {
 		case "toolkit":
-			// v0.2.6：与 mail-toolkit ExportSmtpCsv 完全一致：domain,smtp_host,smtp_port,account,password,security
-			// smtp_host = smtp.{根域名}（mail-toolkit 约定；部署时已加 smtp A 记录指向 server_ip）
-			// account = info@{根域名}（从 smtp_account 归一化：取 @ 前缀 + @根域，兼容老数据里 info@fqdn）
-			_ = rootPwd
-			_ = fqdn // 不再用 fqdn 做 host；smtp.{域} 是统一入口
-			account := acct
-			if at := strings.LastIndex(account, "@"); at >= 0 {
-				account = account[:at] + "@" + domain
-			} else if account != "" {
-				account = account + "@" + domain
-			}
+			// 与 mail-toolkit ExportSmtpCsv 完全一致：domain,smtp_host,smtp_port,account,password,security
 			lines = append(lines, strings.Join([]string{
 				csvField(domain), csvField("smtp." + domain), "587",
-				csvField(account), csvField(pass), "STARTTLS",
+				csvField(tkAccount), csvField(pass), "STARTTLS",
 			}, ","))
+		case "toolkit_short":
+			// mail-toolkit 简短格式 account----password（同域 smtp.根域；丢 host/port，
+			// 发件器靠 From 域自动连 smtp.根域）。即用户用 toolkit 搭多台时导出的那种格式。
+			lines = append(lines, tkAccount+"----"+pass)
+		case "toolkit_full":
+			// mail-toolkit / brutal-mailer 完整 ---- 格式 account----password----host:port----security
+			lines = append(lines, fmt.Sprintf("%s----%s----smtp.%s:587----STARTTLS", tkAccount, pass, domain))
 		case "smtp_v2":
 			lines = append(lines, fmt.Sprintf("%s:587:%s:%s:%s:%d", ip, acct, pass, personaType, hideIP))
 		case "smtp_v3":

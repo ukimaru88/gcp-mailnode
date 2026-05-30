@@ -161,6 +161,8 @@ export default function Batch() {
   // Step 3 搭建邮局 Modal
   const [deployModalOpen, setDeployModalOpen] = useState(false)
   const [hideClientIP, setHideClientIP] = useState(true)
+  // v0.2.9：第三步当场选搭建方式，''=跟随各 VPS 模板，否则统一覆盖
+  const [deployTypeSel, setDeployTypeSel] = useState<'' | 'kumomta' | 'postfix'>('')
   const [domainIPText, setDomainIPText] = useState('')
   const [aliID, setAliID] = useState('')
 
@@ -441,6 +443,7 @@ export default function Batch() {
         domain_ip_map: map,
         aliyun_cred_id: aliID,
         hide_client_ip: hideClientIP,
+        deploy_type: deployTypeSel,
       } as any)
       if (taskID) setCurrentTaskID(taskID)
       toast('success', `阶段 C 已启动${taskID ? `：${taskID}` : ''}`)
@@ -995,6 +998,29 @@ export default function Batch() {
                 <option value="">请选择...</option>
                 {alis.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
               </select>
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">搭建方式</label>
+              <div className="grid grid-cols-3 gap-2">
+                {([['', '跟随模板'], ['kumomta', '🚀 KumoMTA'], ['postfix', '📬 Postfix']] as const).map(([val, label]) => (
+                  <button key={val} type="button" onClick={() => setDeployTypeSel(val)}
+                          className={`px-2 py-2 rounded-md border text-sm transition-colors ${
+                            deployTypeSel === val
+                              ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-200'
+                              : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'
+                          }`}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-1">
+                {deployTypeSel === ''
+                  ? '按每台 VPS 所用模板的类型部署（默认）。'
+                  : deployTypeSel === 'postfix'
+                    ? 'Postfix + OpenDKIM 纯发信（仅单 NIC；多 NIC 自动回退 KumoMTA）。屏蔽 IP 开关仅对 KumoMTA 生效。'
+                    : 'KumoMTA 纯发信 MTA（透明中继 + DKIM）。'}
+              </div>
             </div>
 
             <label className="flex items-start gap-2 p-3 bg-slate-900 border border-slate-700 rounded-md cursor-pointer">

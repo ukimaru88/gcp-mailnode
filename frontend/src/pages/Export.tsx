@@ -3,7 +3,7 @@ import { Download, Copy } from 'lucide-react'
 import { ExportSMTP } from '../../wailsjs/go/main/App'
 import { useToast } from '../components/Toast'
 
-type Format = 'smtp' | 'smtp_v2' | 'smtp_v3' | 'toolkit'
+type Format = 'smtp' | 'smtp_v2' | 'smtp_v3' | 'toolkit' | 'toolkit_short' | 'toolkit_full'
 
 export default function Export() {
   const { toast } = useToast()
@@ -81,6 +81,30 @@ export default function Export() {
             <div className="text-xs text-slate-500 mt-1">
               与 mail-toolkit ExportSmtpCsv 完全一致：host=<span className="font-mono text-slate-300">smtp.根域</span>，account=<span className="font-mono text-slate-300">info@根域</span>。
               发件器靠 From 域名自动连 smtp.根域:587 (STARTTLS)。
+            </div>
+          </button>
+          <button onClick={() => setFormat('toolkit_short')}
+                  className={`text-left px-3 py-3 rounded-md border transition-colors ${
+                    format === 'toolkit_short'
+                      ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-200'
+                      : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'
+                  }`}>
+            <div className="font-medium text-sm">⭐ toolkit 简短（账号----密码）</div>
+            <div className="text-xs text-slate-500 mt-1 font-mono">info@根域----密码</div>
+            <div className="text-xs text-slate-500 mt-1">
+              与你用 mail-toolkit 搭建多台时导出的格式一致。同域 smtp.根域，发件器靠 From 域自动连 smtp.根域:587。
+            </div>
+          </button>
+          <button onClick={() => setFormat('toolkit_full')}
+                  className={`text-left px-3 py-3 rounded-md border transition-colors ${
+                    format === 'toolkit_full'
+                      ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-200'
+                      : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'
+                  }`}>
+            <div className="font-medium text-sm">toolkit 完整（----分隔）</div>
+            <div className="text-xs text-slate-500 mt-1 font-mono">账号----密码----host:port----security</div>
+            <div className="text-xs text-slate-500 mt-1">
+              mail-toolkit / brutal-mailer 完整 ---- 格式，带 smtp.根域:587 与 STARTTLS。
             </div>
           </button>
         </div>

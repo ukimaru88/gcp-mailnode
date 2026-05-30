@@ -52,11 +52,15 @@ type StageCRequest struct {
 	AliyunCredID string            `json:"aliyun_cred_id"`
 	HideClientIP bool              `json:"hide_client_ip"`
 	PersonaID    string            `json:"persona_id"`
+	// v0.2.9：第三步当场选的部署方式，覆盖模板默认。空=跟随各 VPS 模板的 deploy_type；
+	// "kumomta"/"postfix"=本批统一用该方式（postfix/mailcow 仅单 NIC，多 NIC 自动回退 kumomta）。
+	DeployType string `json:"deploy_type"`
 }
 
 type DeployOpts struct {
 	HideClientIP bool   `json:"hide_client_ip"`
 	PersonaID    string `json:"persona_id"`
+	DeployType   string `json:"deploy_type"` // v0.2.9：空=跟随 VPS 模板；非空覆盖（postfix/mailcow 多 NIC 回退 kumomta）
 }
 
 type PersonaSpec struct {
@@ -1022,7 +1026,7 @@ func StartStageCWithPersona(ctx context.Context, req StageCRequest, personaSpec 
 				if err := upsertAliyunRecordAndSyncLocal(runCtx, db, aliyunDNS, req.AliyunCredID, d, vpsID, dns.DnsRecordSpec{RR: "@", RecordType: "A", Value: ip}, logC); err != nil {
 					logC("WARN", "UpsertRecord A 失败: %v", err)
 				}
-				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
+				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID, DeployType: req.DeployType}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
 					logC("ERROR", "部署 KumoMTA 失败: %v", err)
 					_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='failed', deploy_error=? WHERE id=?`, err.Error(), vpsID)
 					atomic.AddInt64(&state.failed, 1)
@@ -1300,11 +1304,23 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, internalIP, fqdn, subdomain,
 		return fmt.Errorf("数据库未就绪")
 	}
 	_ = rootPwd
-	// 读 VPS 的 deploy_type，决定走 KumoMTA（纯发信）还是 mailcow（收发一体）
+	// 读 VPS 的 deploy_type，决定走 KumoMTA（纯发信）/ Postfix / mailcow（收发一体）
 	var deployType string
-	_ = db.QueryRowContext(ctx, `SELECT COALESCE(deploy_type,'kumomta') FROM vps_instances WHERE id=?`, vpsID).Scan(&deployType)
+	var ncOverride int
+	_ = db.QueryRowContext(ctx, `SELECT COALESCE(deploy_type,'kumomta'), COALESCE(nic_count,1) FROM vps_instances WHERE id=?`, vpsID).Scan(&deployType, &ncOverride)
 	if deployType == "" {
 		deployType = "kumomta"
+	}
+	// v0.2.9：第三步当场选的部署方式覆盖模板默认（前端可选 KumoMTA/Postfix）。
+	// postfix/mailcow 仅支持单 NIC，多 NIC 自动回退 kumomta（与 Stage B 的限制一致）。
+	if opts.DeployType != "" {
+		if (opts.DeployType == "postfix" || opts.DeployType == "mailcow") && ncOverride > 1 {
+			log("WARN", "多 NIC（nic_count=%d）只支持 KumoMTA，忽略部署方式覆盖=%s，仍用 kumomta", ncOverride, opts.DeployType)
+			deployType = "kumomta"
+		} else {
+			deployType = opts.DeployType
+			log("INFO", "部署方式由第三步指定覆盖为：%s", deployType)
+		}
 	}
 	if deployType == "mailcow" {
 		log("INFO", "部署类型=mailcow（收发一体邮件服务器）")

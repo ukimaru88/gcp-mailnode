@@ -51,6 +51,7 @@ export namespace deploy {
 	export class DeployOpts {
 	    hide_client_ip: boolean;
 	    persona_id: string;
+	    deploy_type: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new DeployOpts(source);
@@ -60,6 +61,7 @@ export namespace deploy {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.hide_client_ip = source["hide_client_ip"];
 	        this.persona_id = source["persona_id"];
+	        this.deploy_type = source["deploy_type"];
 	    }
 	}
 	export class StageARequest {
@@ -111,6 +113,7 @@ export namespace deploy {
 	    aliyun_cred_id: string;
 	    hide_client_ip: boolean;
 	    persona_id: string;
+	    deploy_type: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new StageCRequest(source);
@@ -122,6 +125,7 @@ export namespace deploy {
 	        this.aliyun_cred_id = source["aliyun_cred_id"];
 	        this.hide_client_ip = source["hide_client_ip"];
 	        this.persona_id = source["persona_id"];
+	        this.deploy_type = source["deploy_type"];
 	    }
 	}
 
