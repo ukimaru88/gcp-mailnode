@@ -610,8 +610,8 @@ export default function Batch() {
                          className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
                          value={vpsCount} onChange={e => setVpsCount(Math.max(1, Math.min(50, Number(e.target.value) || 1)))} />
                   <p className="text-[10px] text-slate-500 mt-0.5">将预留 <span className="text-indigo-400 font-semibold">{vpsCount} × {tplNICCount} = {totalIPCount}</span> 个清洁 IP</p>
-                  {totalIPCount > 24 && (
-                    <p className="text-[10px] text-amber-400 mt-0.5">⚠ 超 24 IP/CPU 配额，GCP Console → IAM & Admin → Quotas 提"In-use IP addresses"和"CPUs"到 ≥ {totalIPCount}</p>
+                  {totalIPCount > 150 && (
+                    <p className="text-[10px] text-amber-400 mt-0.5">⚠ 接近企业默认 STATIC_ADDRESSES=175 配额，可去 GCP Console → IAM & Admin → Quotas 提升。30-150 台属于常规范围，无需提额。</p>
                   )}
                 </div>
                 <div>

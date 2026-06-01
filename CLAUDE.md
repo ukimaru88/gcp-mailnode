@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.17**（`version.txt`；删 SpamRATS 4 RBL，DoH 三 endpoint 重试，单 IP 7.5s→0.6s）
+> 当前版本：**v0.2.18**（`version.txt`；修过时 24 IP 配额警告，改为接近 175 才提醒）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.17** | 最新。**修 DNSBL 漏报 + 加速**：用户反馈 mxtoolbox 显示 IP 在 SpamRATS-Dyna LISTED 但软件判 clean。根因 SpamRATS 权威 DNS 限速 Cloudflare/Google DoH 递归查询，4 个 SpamRATS RBL 经 DoH 全超时（错误数 6/26 < 半数 13 → 仍判 Clean）。处理：① **删 SpamRATS 全 4 个** RBL（DoH 不可达 + 对云 IP 一刀切误杀 + 主流邮件商 Gmail/Outlook/Yahoo 不查，对实际投递无影响；PBL 类云 IP 屏蔽已被 Spamhaus ZEN 含 PBL 覆盖）② **DoH 三 endpoint 串行重试**（Cloudflare 1.1.1.1/1.0.0.1 + Google dns.google），每次独立 2.5s 超时，任一返回 NXDOMAIN/NOERROR 立即返回 ③ defaultTimeout 3s→8s 容纳三次重试。实测单 IP 0.6s 完成 22 RBL（v0.2.12 是 3s/26 RBL；v0.2.16 含 SpamRATS 拖累实际 7.5s）。给用户透明感：UI 现在显示"22 个高权重 RBL"不再误导 |
+| **v0.2.18** | 最新。**修过时 24 IP/CPU 警告**：Batch.tsx 服务器数量提示从硬编码 `> 24 警告` 改为 `> 150` 才提醒（贴合企业默认 STATIC_ADDRESSES=175 配额）。之前 24 是 v0.1.74 之前 GCP 老默认值，企业账号实际 IP 175/CPU 1500/INSTANCES 6000，30 台 e2-micro 仅需 30 IP/7.5 CPU/30 实例，远在配额内 |
+| v0.2.17 | **修 DNSBL 漏报 + 加速**：用户反馈 mxtoolbox 显示 IP 在 SpamRATS-Dyna LISTED 但软件判 clean。根因 SpamRATS 权威 DNS 限速 Cloudflare/Google DoH 递归查询，4 个 SpamRATS RBL 经 DoH 全超时（错误数 6/26 < 半数 13 → 仍判 Clean）。处理：① **删 SpamRATS 全 4 个** RBL（DoH 不可达 + 对云 IP 一刀切误杀 + 主流邮件商 Gmail/Outlook/Yahoo 不查，对实际投递无影响；PBL 类云 IP 屏蔽已被 Spamhaus ZEN 含 PBL 覆盖）② **DoH 三 endpoint 串行重试**（Cloudflare 1.1.1.1/1.0.0.1 + Google dns.google），每次独立 2.5s 超时，任一返回 NXDOMAIN/NOERROR 立即返回 ③ defaultTimeout 3s→8s 容纳三次重试。实测单 IP 0.6s 完成 22 RBL（v0.2.12 是 3s/26 RBL；v0.2.16 含 SpamRATS 拖累实际 7.5s）。给用户透明感：UI 现在显示"22 个高权重 RBL"不再误导 |
 | v0.2.16 | **UI 加区域单选（东京/大阪/首尔）**。实测 IP 池分布（cmd/ippool hold 150 个）：东京 asia-northeast1 当前 100% 是 34./35.；大阪 asia-northeast2 100% 是 34.97；**韩国 asia-northeast3 约 18% 是 8.230.x**（Google 2023+ 新段，避开 34./35. 主力段的唯一可行选项）。stages.go 按 req.Regions[0] 切单 region（白名单校验只允 northeast1/2/3）；Batch.tsx Step 1 加下拉，每个区域显示池子特征 + 适用场景说明。默认仍东京（保守），切首尔时 UI 提示韩国→日本邮箱网络 ~50ms |
 | v0.2.15 | **回退 v0.2.14 双区域**：实测负优化（用户 1000+ reserve 都没命中非 34./35.）。dirtyIPHolder "占满池子触发 GCP 翻新"机制必须**单池子撑到 175 配额顶**才生效；双区域让 worker 50/50 分流，东京 hold 池只撑到 ~87 个（远不到 175），翻新机制失效；同时大阪池实测 100% 是 34.97 段，双区不仅没翻倍命中率反而把东京原本能命中 104./136. 的概率砍半。回到 v0.2.13 单东京。**经验教训**：v0.1.63 dirtyIPHolder 注释明确说"用户配额越大 hold 越多脏 IP 翻新效果越好"，本质是"撑满 GCP 内部池"，加 region 是反向的（稀释 hold 而非翻倍 hold） |
 | ~~v0.2.14~~ | 已回退。**解锁日本东京+大阪双区域并发筛 IP**：之前 stages.go:101 锁死 `asia-northeast1`，用户排除 34./35. 主力段时 hold 池单区域 175 配额一撞顶就 60s 冷却。改为 `["asia-northeast1", "asia-northeast2"]` 双区并发，**hold 池容量翻倍 350、两个池子翻新独立**，非 34./35.（如 104./136.）命中率显著上升。Stage B 已天然支持（IP 自带 region，自动选 zone）；多 NIC `groupCleanIPs` 按 (cred\|region) 分区保证同组同区不跨拼。UI Step 1 卡片提示"日本东京 + 大阪 双区并发"。app_templates.go 预设 Regions 同步两区域 |
