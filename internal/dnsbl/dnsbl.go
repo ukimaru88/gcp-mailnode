@@ -62,12 +62,8 @@ type dohJSONResponse struct {
 	} `json:"Answer"`
 }
 
-// dohLookup 用 DoH JSON API 查 A 记录。返回 *net.DNSError(IsNotFound=true) 表示
-// NXDOMAIN/未命中（与 net.Resolver 行为对齐，调用方原本就按这个判 RBL miss）；
-// 其他错误视为查询失败（上层会标 errorCount）。
-func dohLookup(ctx context.Context, name string) ([]string, error) {
-	idx := atomic.AddUint64(&dohRoundRobin, 1)
-	endpoint := dohEndpoints[idx%uint64(len(dohEndpoints))]
+// dohLookupOnce 单次 DoH 调用（指定 endpoint），不重试。
+func dohLookupOnce(ctx context.Context, endpoint, name string) ([]string, error) {
 	u := endpoint + "?name=" + url.QueryEscape(name) + "&type=A"
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
@@ -86,10 +82,11 @@ func dohLookup(ctx context.Context, name string) ([]string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
 		return nil, err
 	}
-	// NXDOMAIN（Status=3）和 NoError 但 Answer 空，都视为未命中
+	// NXDOMAIN（Status=3）：明确未命中
 	if d.Status == 3 {
 		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 	}
+	// SERVFAIL/FORMERR/REFUSED/NOTIMP（Status 1/2/4/5）：服务异常，返回错误让上层重试
 	if d.Status != 0 {
 		return nil, fmt.Errorf("DoH RCODE=%d", d.Status)
 	}
@@ -103,6 +100,46 @@ func dohLookup(ctx context.Context, name string) ([]string, error) {
 		return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 	}
 	return addrs, nil
+}
+
+// dohLookup 用 DoH JSON API 查 A 记录，全部 endpoint 串行重试。
+// v0.2.17：之前单次 endpoint 失败就放弃，SpamRATS 系列 RBL 经 DoH 转发慢，
+// 3s 单次超时常失败 → 漏报黑名单命中（mxtoolbox 显示 LISTED 但软件判 clean）。
+// 改成三个 endpoint 串行重试（Cloudflare 主/备 + Google），每次独立超时；
+// 任一返回 NXDOMAIN 或 NOERROR 立即返回，全部超时/异常才报错。
+//
+// 返回 *net.DNSError(IsNotFound=true) 表示 NXDOMAIN/未命中（与 net.Resolver 对齐）；
+// 其他错误（全部 endpoint 都失败）视为查询失败（上层标 errorCount）。
+func dohLookup(ctx context.Context, name string) ([]string, error) {
+	// 起始 endpoint 轮询索引：避免热点
+	startIdx := atomic.AddUint64(&dohRoundRobin, 1)
+
+	var lastErr error
+	const perTryTimeout = 2500 * time.Millisecond
+	for i := 0; i < len(dohEndpoints); i++ {
+		endpoint := dohEndpoints[(startIdx+uint64(i))%uint64(len(dohEndpoints))]
+		// 单次 endpoint 独立超时，不被上一次失败累计
+		tryCtx, cancel := context.WithTimeout(ctx, perTryTimeout)
+		addrs, err := dohLookupOnce(tryCtx, endpoint, name)
+		cancel()
+		if err == nil {
+			return addrs, nil
+		}
+		// NXDOMAIN/未命中：明确结果，不再换 endpoint
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return nil, err
+		}
+		// 上层 ctx 已 done：放弃后续 endpoint
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all DoH endpoints failed")
+	}
+	return nil, lastErr
 }
 
 // TestResolver 暴露 DoH 解析给外部基准/诊断用，不算稳定 API。
@@ -159,11 +196,16 @@ var DefaultZones = []Zone{
 	{"ixBL", "ix.dnsbl.manitu.net"},
 	// WPBL
 	{"WPBL", "db.wpbl.info"},
-	// SpamRATS 系（含 RATS Dyna / RATS NoPtr / RATS Spam）— v0.1.16 补
-	{"SpamRATS-All", "all.spamrats.com"},
-	{"SpamRATS-Dyna", "dyna.spamrats.com"},
-	{"SpamRATS-NoPtr", "noptr.spamrats.com"},
-	{"SpamRATS-Spam", "spam.spamrats.com"},
+	// v0.2.17：SpamRATS 全系列删除。理由：
+	// 1) SpamRATS 权威 DNS 限速 Cloudflare/Google DoH 递归查询，单次 5s+ 全超时，
+	//    经 DoH 公网根本查不到（mxtoolbox 用 53 端口直接查能查到）
+	// 2) SpamRATS-Dyna 把 GCP/AWS/Azure 等云厂商整个 IP 段一刀切列为"动态 IP"，
+	//    误杀率极高
+	// 3) 主流邮件商（Gmail/Outlook/Yahoo）**不查** SpamRATS-Dyna，对实际投递无影响
+	// 4) 保留只会让用户误以为"软件 26 RBL 全查到"实际 4 个无效，且 mxtoolbox 显示
+	//    LISTED 时用户怀疑软件漏报
+	// 真正影响投递的 PBL 类（云 IP 屏蔽）已被 Spamhaus ZEN（含 PBL）覆盖。
+	// 历史：v0.1.16 加，v0.2.17 删。
 }
 
 // ZoneResult 单个 zone 的查询结果。TXT 首版保留字段，始终为空串。
@@ -192,7 +234,10 @@ type CheckResult struct {
 
 const (
 	defaultThreshold = 1 // v0.1.9：命中任何一个 RBL 即判脏，最严标准
-	defaultTimeout   = 3 * time.Second
+	// v0.2.17：单 zone 上层超时 3s → 8s。DoH 走 HTTPS（443）有 TLS 握手开销 +
+	// SpamRATS 等 RBL 经 DoH 转发慢，单次 2.5s 重试 3 个 endpoint 需要 ~7.5s 上限。
+	// 之前 3s 让 SpamRATS-Dyna 等 RBL 全部超时，漏报黑名单命中。
+	defaultTimeout = 8 * time.Second
 )
 
 // reverseIPv4 把 "1.2.3.4" 反转成 "4.3.2.1"。
