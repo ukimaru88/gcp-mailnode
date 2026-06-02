@@ -1563,6 +1563,85 @@ chmod +x /tmp/deploy_config.sh
 	return nil
 }
 
+// v0.2.21：缓存已验证域名，整个 Stage A→D 流程内只验证一次同一根域。
+var (
+	verifiedDomains   sync.Map // rootDomain → time.Time(成功时间)，nil 值表示进行中
+	verifiedDomainsMu sync.Map // rootDomain → *sync.Mutex，串行化同域名的并发验证
+)
+
+// ensureDomainVerified 确保 GCP 项目已验证 rootDomain 的所有权。流程：
+//  1. 缓存命中 → 立即返回
+//  2. IsDomainVerified - 已验证则缓存返回
+//  3. GetVerifyToken - 拿 google-site-verification=xxx
+//  4. AddRecord 阿里云 DNS @ TXT（不用 Upsert 避免覆盖 SPF）
+//  5. 等 60s DNS 传播
+//  6. InsertWebResource - Google 完成验证
+//
+// 失败时返回 error，调用方决定是否阻断流程（PTR 推荐：警告 + 跳过 PTR 但保留部署）。
+// 缓存避免同一域名多 VPS 重复验证；mu 保证并发部署时同一域名串行执行。
+func ensureDomainVerified(ctx context.Context, gcpClient *gcp.Client, aliyunDNS *dns.AliyunDns, rootDomain string, log func(level, format string, args ...interface{})) error {
+	if rootDomain == "" {
+		return fmt.Errorf("rootDomain 为空")
+	}
+	// 命中缓存 → 直接返回
+	if _, ok := verifiedDomains.Load(rootDomain); ok {
+		return nil
+	}
+	// 串行化同一域名的并发请求
+	muRaw, _ := verifiedDomainsMu.LoadOrStore(rootDomain, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	// 二次确认（其他 goroutine 已经完成）
+	if _, ok := verifiedDomains.Load(rootDomain); ok {
+		return nil
+	}
+
+	sv := gcp.NewSiteVerifyClient(gcpClient)
+
+	// 1) 已验证 → 缓存
+	verified, _ := sv.IsDomainVerified(ctx, rootDomain)
+	if verified {
+		verifiedDomains.Store(rootDomain, time.Now())
+		log("INFO", "GCP 域名所有权 %s 已验证（之前）", rootDomain)
+		return nil
+	}
+
+	log("INFO", "GCP 域名所有权验证开始: %s（未验证）", rootDomain)
+
+	// 2) 拿验证 token
+	token, err := sv.GetVerifyToken(ctx, rootDomain)
+	if err != nil {
+		return fmt.Errorf("GetVerifyToken: %w", err)
+	}
+	log("INFO", "GCP 给到验证 TXT: %s", token)
+
+	// 3) 阿里云 DNS 加 TXT @（用 AddRecord 不是 Upsert，避免覆盖 SPF）
+	//    DomainRecordDuplicate 时忽略（说明 TXT 已存在，可能上次半途失败留下的）
+	if _, err := aliyunDNS.AddRecord(rootDomain, "@", "TXT", token, nil); err != nil {
+		if !strings.Contains(err.Error(), "DomainRecordDuplicate") {
+			return fmt.Errorf("阿里云 AddRecord TXT: %w", err)
+		}
+		log("INFO", "TXT 已存在（DomainRecordDuplicate），继续")
+	}
+
+	// 4) 等 DNS 传播。阿里云 DNS 推送 < 10s，加余量 60s。
+	log("INFO", "等 60s DNS 传播...")
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(60 * time.Second):
+	}
+
+	// 5) Google 验证
+	if err := sv.InsertWebResource(ctx, rootDomain); err != nil {
+		return fmt.Errorf("InsertWebResource: %w", err)
+	}
+	log("INFO", "✅ GCP 域名所有权验证完成: %s", rootDomain)
+	verifiedDomains.Store(rootDomain, time.Now())
+	return nil
+}
+
 // autoSetPTRForSupportedNICs deploy 末尾自动设置所有 NIC 的 PTR。
 //
 // v0.1.75 修正（之前 v0.1.74 注释"实测支持 nic1+"是错的）：
@@ -1594,6 +1673,25 @@ func autoSetPTRForSupportedNICs(ctx context.Context, db *sql.DB, vpsID, ip, fqdn
 	defer cli.Close()
 
 	_, _ = db.Exec(`UPDATE vps_instances SET ptr_status='pending' WHERE id=?`, vpsID)
+
+	// v0.2.21：GCP 自 2023 强制要求 PTR 域名所有权验证（GoogleAPI 400 "Please verify
+	// ownership of the PTR domain"）。在调 SetInstancePTR 前自动验证 rootDomain。
+	// rootDomain 在前面 SQL 里读到（domain 字段）。空时跳过（无 domain 的 VPS）。
+	if rootDomain != "" {
+		var aliyunCredID string
+		_ = db.QueryRowContext(ctx, `SELECT COALESCE(aliyun_cred_id,'') FROM vps_instances WHERE id=?`, vpsID).Scan(&aliyunCredID)
+		if aliyunCredID != "" {
+			if aliDNS, aerr := loadAliyunDns(aliyunCredID); aerr == nil {
+				if verr := ensureDomainVerified(ctx, cli, aliDNS, rootDomain, log); verr != nil {
+					log("WARN", "auto-PTR：GCP 域名所有权验证失败，PTR 可能失败: %v", verr)
+					log("WARN", "auto-PTR：常见原因：① SA 缺 Site Verification 权限 → GCP Console 给 SA 加 'Site Verification Owner' 角色")
+					log("WARN", "auto-PTR：② 项目未启用 Site Verification API → https://console.cloud.google.com/apis/library/siteverification.googleapis.com")
+					log("WARN", "auto-PTR：③ 域名 DNS 未在阿里云托管或权限不足")
+					// 不阻断 —— 让 SetInstancePTR 继续尝试，失败时 v0.1.75 已有反向校验和告警
+				}
+			}
+		}
+	}
 
 	// nic0 主 PTR
 	log("INFO", "auto-PTR nic0: %s -> %s", ip, fqdn)
