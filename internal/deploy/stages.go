@@ -55,12 +55,16 @@ type StageCRequest struct {
 	// v0.2.9：第三步当场选的部署方式，覆盖模板默认。空=跟随各 VPS 模板的 deploy_type；
 	// "kumomta"/"postfix"=本批统一用该方式（postfix/mailcow 仅单 NIC，多 NIC 自动回退 kumomta）。
 	DeployType string `json:"deploy_type"`
+	// v0.2.19：邮箱 local-part（账号的 @ 前缀）。空=默认 "info"。
+	// 仅允许 [a-z0-9._-]，后端会校验；最终账号 = MailUser + "@" + 根域。
+	MailUser string `json:"mail_user"`
 }
 
 type DeployOpts struct {
 	HideClientIP bool   `json:"hide_client_ip"`
 	PersonaID    string `json:"persona_id"`
 	DeployType   string `json:"deploy_type"` // v0.2.9：空=跟随 VPS 模板；非空覆盖（postfix/mailcow 多 NIC 回退 kumomta）
+	MailUser     string `json:"mail_user"`   // v0.2.19：空=info；非空覆盖 SMTP 账号 local-part
 }
 
 type PersonaSpec struct {
@@ -1038,7 +1042,7 @@ func StartStageCWithPersona(ctx context.Context, req StageCRequest, personaSpec 
 				if err := upsertAliyunRecordAndSyncLocal(runCtx, db, aliyunDNS, req.AliyunCredID, d, vpsID, dns.DnsRecordSpec{RR: "@", RecordType: "A", Value: ip}, logC); err != nil {
 					logC("WARN", "UpsertRecord A 失败: %v", err)
 				}
-				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID, DeployType: req.DeployType}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
+				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID, DeployType: req.DeployType, MailUser: req.MailUser}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
 					logC("ERROR", "部署 KumoMTA 失败: %v", err)
 					_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='failed', deploy_error=? WHERE id=?`, err.Error(), vpsID)
 					atomic.AddInt64(&state.failed, 1)
@@ -1336,11 +1340,11 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, internalIP, fqdn, subdomain,
 	}
 	if deployType == "mailcow" {
 		log("INFO", "部署类型=mailcow（收发一体邮件服务器）")
-		return deployMailcowOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, aliyunDNS, aliyunCredID, log)
+		return deployMailcowOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, opts.MailUser, aliyunDNS, aliyunCredID, log)
 	}
 	if deployType == "postfix" {
 		log("INFO", "部署类型=postfix（Postfix + OpenDKIM 纯发信）")
-		return deployPostfixOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, aliyunDNS, aliyunCredID, log)
+		return deployPostfixOnVPS(ctx, db, vpsID, ip, fqdn, subdomain, domain, opts.MailUser, aliyunDNS, aliyunCredID, log)
 	}
 	log("INFO", "部署类型=kumomta（纯发信 MTA）")
 
@@ -1413,6 +1417,7 @@ func deployMTAOnVPS(ctx context.Context, vpsID, ip, internalIP, fqdn, subdomain,
 	}
 	v := BuildDeployVarsMultiNIC(domain, subdomain, internalIP, sources)
 	v.HideClientIP = opts.HideClientIP
+	v.OverrideMailUser(opts.MailUser) // v0.2.19：StageC 当场指定的账号前缀
 	// Persona 伪造完全在 brutal-mailer 侧完成，KumoMTA 只做透明中继；
 	// persona 参数保留是为了不破坏外部调用签名，这里不写入任何 persona 头。
 	_ = persona
@@ -1734,9 +1739,10 @@ func shellQuote(s string) string {
 //   - 不部署 unsub-server（unsub 仅 KumoMTA 路径走）
 //   - DKIM 公钥从 install_postfix.sh 的 stdout 行 "DKIM_PUBLIC_KEY=..." 捕获
 //   - DNS 记录与 KumoMTA 单 NIC 场景一致：DKIM/MX/SPF/DMARC
-func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
+func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain, mailUser string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
+	v.OverrideMailUser(mailUser) // v0.2.19
 
 	// v0.2.11：dump 入参与渲染结果，便于排查 v.FQDN/v.RootDomain 不一致这类离谱 bug。
 	log("INFO", "[debug] deployPostfixOnVPS 入参 domain=%q subdomain=%q ip=%q", domain, subdomain, ip)
@@ -1795,9 +1801,10 @@ func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdom
 	return nil
 }
 
-func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
+func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdomain, domain, mailUser string, aliyunDNS *dns.AliyunDns, aliyunCredID string, log func(level, format string, args ...interface{})) error {
 	sshCfg := ssh.Config{Host: ip, Port: 22, Username: "root", KeyContent: string(sshkey.PrivatePEM())}
 	v := BuildDeployVars(domain, subdomain, ip)
+	v.OverrideMailUser(mailUser) // v0.2.19
 
 	log("INFO", "开始安装 mailcow（Docker + Postfix + Dovecot + Rspamd）")
 	installScript, err := RenderInstallMailcow(v)

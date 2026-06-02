@@ -165,6 +165,8 @@ export default function Batch() {
   const [hideClientIP, setHideClientIP] = useState(true)
   // v0.2.9：第三步当场选搭建方式，''=跟随各 VPS 模板，否则统一覆盖
   const [deployTypeSel, setDeployTypeSel] = useState<'' | 'kumomta' | 'postfix'>('')
+  // v0.2.19：邮箱账号 local-part（默认 info），仅 [a-z0-9._-]
+  const [mailUser, setMailUser] = useState<string>('info')
   const [domainIPText, setDomainIPText] = useState('')
   const [aliID, setAliID] = useState('')
 
@@ -451,6 +453,7 @@ export default function Batch() {
         aliyun_cred_id: aliID,
         hide_client_ip: hideClientIP,
         deploy_type: deployTypeSel,
+        mail_user: mailUser,
       } as any)
       if (taskID) setCurrentTaskID(taskID)
       toast('success', `阶段 C 已启动${taskID ? `：${taskID}` : ''}`)
@@ -1020,6 +1023,20 @@ export default function Batch() {
                 <option value="">请选择...</option>
                 {alis.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
               </select>
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                邮箱账号前缀 <span className="text-slate-500 font-normal">（最终 = 前缀@根域；默认 info）</span>
+              </label>
+              <input type="text" className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm font-mono focus:border-indigo-500 outline-none"
+                     placeholder="info"
+                     value={mailUser}
+                     onChange={e => setMailUser(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 32))} />
+              <div className="text-[11px] text-slate-500 mt-0.5">
+                可改成 sales / hello / contact / no-reply 等。仅允许 <span className="font-mono">a-z 0-9 . - _</span>，不能以点/连字符开头结尾。
+                最终账号示例：<span className="font-mono text-indigo-300">{(mailUser || 'info').replace(/^[.\-]+|[.\-]+$/g, '') || 'info'}@example.com</span>
+              </div>
             </div>
 
             <div>

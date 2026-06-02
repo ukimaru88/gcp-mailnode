@@ -52,6 +52,7 @@ export namespace deploy {
 	    hide_client_ip: boolean;
 	    persona_id: string;
 	    deploy_type: string;
+	    mail_user: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new DeployOpts(source);
@@ -62,6 +63,7 @@ export namespace deploy {
 	        this.hide_client_ip = source["hide_client_ip"];
 	        this.persona_id = source["persona_id"];
 	        this.deploy_type = source["deploy_type"];
+	        this.mail_user = source["mail_user"];
 	    }
 	}
 	export class StageARequest {
@@ -114,6 +116,7 @@ export namespace deploy {
 	    hide_client_ip: boolean;
 	    persona_id: string;
 	    deploy_type: string;
+	    mail_user: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new StageCRequest(source);
@@ -126,6 +129,7 @@ export namespace deploy {
 	        this.hide_client_ip = source["hide_client_ip"];
 	        this.persona_id = source["persona_id"];
 	        this.deploy_type = source["deploy_type"];
+	        this.mail_user = source["mail_user"];
 	    }
 	}
 

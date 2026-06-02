@@ -89,9 +89,9 @@ curl -sk -X POST -H "Content-Type: application/json" -H "X-API-Key: $MAILCOW_API
     -d '{"domain":"{DOMAIN}","description":"auto-created by gcp-mailnode","aliases":400,"mailboxes":10,"defquota":512,"maxquota":10240,"quota":10240,"active":"1","rl_value":"","rl_frame":"s","backupmx":"0","relay_all_recipients":"0","relay_unknown_only":"0"}' \
     "https://127.0.0.1/api/v1/add/domain" 2>/dev/null || echo "(域名可能已存在或 API key 未就绪，请手动通过 Web UI 添加)"
 
-# 增加用户 info@{DOMAIN}
+# 增加用户 {MAIL_USER_LOCAL}@{DOMAIN}
 curl -sk -X POST -H "Content-Type: application/json" -H "X-API-Key: $MAILCOW_API_KEY" \
-    -d '{"local_part":"info","domain":"{DOMAIN}","password":"{PASSWORD}","password2":"{PASSWORD}","quota":"1024","active":"1","name":"info"}' \
+    -d '{"local_part":"{MAIL_USER_LOCAL}","domain":"{DOMAIN}","password":"{PASSWORD}","password2":"{PASSWORD}","quota":"1024","active":"1","name":"{MAIL_USER_LOCAL}"}' \
     "https://127.0.0.1/api/v1/add/mailbox" 2>/dev/null || echo "(用户可能已存在或 API key 未就绪)"
 
 echo "=== install_mailcow.sh done ==="

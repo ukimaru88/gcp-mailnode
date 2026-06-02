@@ -68,6 +68,37 @@ func BuildDeployVars(rootDomain, subdomain, bindIP string) DeployVars {
 	return BuildDeployVarsMultiNIC(rootDomain, subdomain, bindIP, nil)
 }
 
+// SanitizeMailUser 校验邮箱 local-part：只允 [a-z0-9._-]，1-32 字符；空或非法回退 DefaultMailUser。
+// v0.2.19：用户在 Stage C UI 自定义账号前缀（"info"→"sales"/"hello"/...）。
+func SanitizeMailUser(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || len(s) > 32 {
+		return DefaultMailUser
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+		default:
+			return DefaultMailUser
+		}
+	}
+	// 不能以点或连字符开头/结尾（postfix/sasldb 兼容性）
+	if s[0] == '.' || s[0] == '-' || s[len(s)-1] == '.' || s[len(s)-1] == '-' {
+		return DefaultMailUser
+	}
+	return s
+}
+
+// OverrideMailUser 用指定的 local-part 覆盖 v.Username（=local + "@" + RootDomain）。
+// 空字符串保持原值不变。调用方应先 SanitizeMailUser。
+func (v *DeployVars) OverrideMailUser(local string) {
+	local = SanitizeMailUser(local)
+	if local == "" || v.RootDomain == "" {
+		return
+	}
+	v.Username = local + "@" + v.RootDomain
+}
+
 // BuildDeployVarsMultiNIC v0.1.57：多 NIC 模式下传 sources（每 NIC 一个 SourceSpec）。
 // sources 为空时按单 source 行为生成（用 bindIP + fqdn 自动填）。
 func BuildDeployVarsMultiNIC(rootDomain, subdomain, bindIP string, sources []SourceSpec) DeployVars {
@@ -244,6 +275,12 @@ func render(path string, v DeployVars) (string, error) {
 	s = strings.ReplaceAll(s, "{SELECTOR}", v.Selector)
 	s = strings.ReplaceAll(s, "{BIND_IP}", v.BindIP)
 	s = strings.ReplaceAll(s, "{USERNAME}", v.Username)
+	// v0.2.19：mailcow 等模板需要"裸 local-part"（不含 @域）。从 Username 取 @ 前缀。
+	mailLocal := DefaultMailUser
+	if at := strings.Index(v.Username, "@"); at > 0 {
+		mailLocal = v.Username[:at]
+	}
+	s = strings.ReplaceAll(s, "{MAIL_USER_LOCAL}", mailLocal)
 	s = strings.ReplaceAll(s, "{PASSWORD}", v.Password)
 	s = strings.ReplaceAll(s, "{HIDE_CLIENT_IP}", boolLua(v.HideClientIP))
 	traceHeaders := "true"
