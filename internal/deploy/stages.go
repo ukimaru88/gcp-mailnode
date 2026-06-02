@@ -500,6 +500,14 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 	hitLists := ""
 	if detail != nil {
 		hitLists = strings.Join(detail.HitLists, ",")
+		// v0.2.20：把仅展示用的命中（SpamRATS 等）拼到 hit_lists 字段供 UI 展示。
+		// 用 [display:] 前缀让前端能区分真命中和展示用命中。
+		if len(detail.DisplayOnlyHits) > 0 {
+			if hitLists != "" {
+				hitLists += " "
+			}
+			hitLists += "[display:" + strings.Join(detail.DisplayOnlyHits, ",") + "]"
+		}
 	}
 	_, _ = db.ExecContext(ctx, `UPDATE static_ips SET dnsbl_result=?, dnsbl_hit_lists=? WHERE id=?`, verdict, hitLists, ipID)
 	if derr != nil {
@@ -515,7 +523,11 @@ func reserveAndFilterOnce(ctx context.Context, batchID string, workerID int, gcp
 			release("released", "target_reached", "")
 			return fmt.Errorf("target_reached")
 		}
-		log("INFO", "IP %s 检测通过 (%s)", addr.IP, reason)
+		if detail != nil && len(detail.DisplayOnlyHits) > 0 {
+			log("INFO", "IP %s 检测通过 (%s) [仅展示命中 %s]", addr.IP, reason, strings.Join(detail.DisplayOnlyHits, ","))
+		} else {
+			log("INFO", "IP %s 检测通过 (%s)", addr.IP, reason)
+		}
 		_, _ = db.ExecContext(ctx, `UPDATE static_ips SET status='clean' WHERE id=?`, ipID)
 		return nil
 	}

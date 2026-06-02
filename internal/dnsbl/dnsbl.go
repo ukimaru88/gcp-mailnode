@@ -35,6 +35,13 @@ var (
 		"https://1.0.0.1/dns-query",  // Cloudflare 备
 		"https://dns.google/resolve", // Google
 	}
+	// v0.2.20：SpamRATS 系列 RBL 被 Cloudflare/Google DoH 限速（实测 RCODE=2 全失败），
+	// 但 NextDNS 能查到（实测 0.5s 返回 LISTED [127.0.0.36]）。
+	// 单查询路径，不参与主轮询。NextDNS 公共匿名端点速率限制：每 IP 每分钟数百次，
+	// 单批 Stage A 筛 20 IP × 4 SpamRATS = 80 次查询，远在限额内。
+	dohEndpointsSpamRATS = []string{
+		"https://dns.nextdns.io",
+	}
 	dohRoundRobin uint64
 
 	// HTTP/2 连接复用：MaxIdleConnsPerHost 大让 25 个并发查询共享 keep-alive，
@@ -111,13 +118,19 @@ func dohLookupOnce(ctx context.Context, endpoint, name string) ([]string, error)
 // 返回 *net.DNSError(IsNotFound=true) 表示 NXDOMAIN/未命中（与 net.Resolver 对齐）；
 // 其他错误（全部 endpoint 都失败）视为查询失败（上层标 errorCount）。
 func dohLookup(ctx context.Context, name string) ([]string, error) {
+	// v0.2.20：SpamRATS 域名走 NextDNS（Cloudflare/Google 经它限速 RCODE=2）。
+	endpoints := dohEndpoints
+	if strings.HasSuffix(strings.ToLower(name), ".spamrats.com") {
+		endpoints = dohEndpointsSpamRATS
+	}
+
 	// 起始 endpoint 轮询索引：避免热点
 	startIdx := atomic.AddUint64(&dohRoundRobin, 1)
 
 	var lastErr error
 	const perTryTimeout = 2500 * time.Millisecond
-	for i := 0; i < len(dohEndpoints); i++ {
-		endpoint := dohEndpoints[(startIdx+uint64(i))%uint64(len(dohEndpoints))]
+	for i := 0; i < len(endpoints); i++ {
+		endpoint := endpoints[(startIdx+uint64(i))%uint64(len(endpoints))]
 		// 单次 endpoint 独立超时，不被上一次失败累计
 		tryCtx, cancel := context.WithTimeout(ctx, perTryTimeout)
 		addrs, err := dohLookupOnce(tryCtx, endpoint, name)
@@ -151,6 +164,10 @@ func TestResolver(ctx context.Context, host string) ([]string, error) {
 type Zone struct {
 	Name string
 	Host string
+	// v0.2.20：仅展示不参与 verdict 判定。用于 SpamRATS 这类对所有云厂商 IP 段一刀切
+	// 列入（对 Gmail/Outlook 等主流邮箱投递无影响）的 RBL：用户能看到命中状态（mxtoolbox
+	// 一致），但 IP 不会被判脏导致 Stage A 全军覆没。
+	DisplayOnly bool
 }
 
 // DefaultZones 默认查询的 DNSBL 区。v0.1.9 扩充到 ~20 个主流 RBL，覆盖 mxtoolbox 主要结果。
@@ -158,54 +175,53 @@ type Zone struct {
 // 故意排除的：Abusix/Invaluement（需付费订阅）、已停服的 Mailspike/Truncate 等。
 var DefaultZones = []Zone{
 	// Spamhaus 系（ZEN 已聚合 SBL+XBL+PBL+CSS+DROP）
-	{"Spamhaus ZEN", "zen.spamhaus.org"},
+	{Name: "Spamhaus ZEN", Host: "zen.spamhaus.org"},
 	// Barracuda
-	{"Barracuda", "b.barracudacentral.org"},
+	{Name: "Barracuda", Host: "b.barracudacentral.org"},
 	// SpamCop
-	{"SpamCop", "bl.spamcop.net"},
+	{Name: "SpamCop", Host: "bl.spamcop.net"},
 	// SORBS 系（dnsbl 聚合 + 几个子列表）
-	{"SORBS", "dnsbl.sorbs.net"},
-	{"SORBS-SPAM", "spam.dnsbl.sorbs.net"},
-	{"SORBS-WEB", "web.dnsbl.sorbs.net"},
-	{"SORBS-ZOMBIE", "zombie.dnsbl.sorbs.net"},
+	{Name: "SORBS", Host: "dnsbl.sorbs.net"},
+	{Name: "SORBS-SPAM", Host: "spam.dnsbl.sorbs.net"},
+	{Name: "SORBS-WEB", Host: "web.dnsbl.sorbs.net"},
+	{Name: "SORBS-ZOMBIE", Host: "zombie.dnsbl.sorbs.net"},
 	// UCEPROTECT 三级
-	{"UCEPROTECT-L1", "dnsbl-1.uceprotect.net"},
-	{"UCEPROTECT-L2", "dnsbl-2.uceprotect.net"},
-	{"UCEPROTECT-L3", "dnsbl-3.uceprotect.net"},
+	{Name: "UCEPROTECT-L1", Host: "dnsbl-1.uceprotect.net"},
+	{Name: "UCEPROTECT-L2", Host: "dnsbl-2.uceprotect.net"},
+	{Name: "UCEPROTECT-L3", Host: "dnsbl-3.uceprotect.net"},
 	// Passive Spam Block List
-	{"PSBL", "psbl.surriel.com"},
+	{Name: "PSBL", Host: "psbl.surriel.com"},
 	// Spamhaus CSS（单独查一次，虽然 ZEN 含了，额外印证）
-	{"Spamhaus CSS", "css.spamhaus.org"},
+	{Name: "Spamhaus CSS", Host: "css.spamhaus.org"},
 	// Swinog
-	{"Swinog URIBL", "uribl.swinog.ch"},
+	{Name: "Swinog URIBL", Host: "uribl.swinog.ch"},
 	// Nordspam
-	{"Nordspam BL", "bl.nordspam.com"},
+	{Name: "Nordspam BL", Host: "bl.nordspam.com"},
 	// 0spam
-	{"0spam", "bl.0spam.org"},
+	{Name: "0spam", Host: "bl.0spam.org"},
 	// BlockedServers
-	{"BlockedServers", "rbl.blockedservers.com"},
+	{Name: "BlockedServers", Host: "rbl.blockedservers.com"},
 	// GBUdb Truncate
-	{"GBUdb Truncate", "truncate.gbudb.net"},
+	{Name: "GBUdb Truncate", Host: "truncate.gbudb.net"},
 	// SpfBL
-	{"SpfBL", "bl.spfbl.net"},
+	{Name: "SpfBL", Host: "bl.spfbl.net"},
 	// Imp-SL（Interserver）
-	{"Interserver", "rbl.interserver.net"},
+	{Name: "Interserver", Host: "rbl.interserver.net"},
 	// JustSpam
-	{"JustSpam", "bl.mailspike.net"},
+	{Name: "JustSpam", Host: "bl.mailspike.net"},
 	// ix.dnsbl
-	{"ixBL", "ix.dnsbl.manitu.net"},
+	{Name: "ixBL", Host: "ix.dnsbl.manitu.net"},
 	// WPBL
-	{"WPBL", "db.wpbl.info"},
-	// v0.2.17：SpamRATS 全系列删除。理由：
-	// 1) SpamRATS 权威 DNS 限速 Cloudflare/Google DoH 递归查询，单次 5s+ 全超时，
-	//    经 DoH 公网根本查不到（mxtoolbox 用 53 端口直接查能查到）
-	// 2) SpamRATS-Dyna 把 GCP/AWS/Azure 等云厂商整个 IP 段一刀切列为"动态 IP"，
-	//    误杀率极高
-	// 3) 主流邮件商（Gmail/Outlook/Yahoo）**不查** SpamRATS-Dyna，对实际投递无影响
-	// 4) 保留只会让用户误以为"软件 26 RBL 全查到"实际 4 个无效，且 mxtoolbox 显示
-	//    LISTED 时用户怀疑软件漏报
-	// 真正影响投递的 PBL 类（云 IP 屏蔽）已被 Spamhaus ZEN（含 PBL）覆盖。
-	// 历史：v0.1.16 加，v0.2.17 删。
+	{Name: "WPBL", Host: "db.wpbl.info"},
+	// v0.2.20：SpamRATS 系列加回。理由：用户实测要求 + NextDNS 能查到（v0.2.17 删因
+	// Cloudflare/Google DoH 经 SpamRATS 限速 RCODE=2 全失败，但 NextDNS 路径通且 0.5s
+	// 内返回）。dohLookup 对 .spamrats.com 域名特殊路由到 NextDNS。
+	// 注：SpamRATS-Dyna 把所有云厂商 IP 段一刀切列为"动态"，对 Gmail/Outlook/Yahoo 投递
+	// 无影响，但用户希望看到 mxtoolbox 一致的结果。
+	{Name: "SpamRATS-All", Host: "all.spamrats.com", DisplayOnly: true},
+	{Name: "SpamRATS-Dyna", Host: "dyna.spamrats.com", DisplayOnly: true},
+	{Name: "SpamRATS-NoPtr", Host: "noptr.spamrats.com", DisplayOnly: true},
+	{Name: "SpamRATS-Spam", Host: "spam.spamrats.com", DisplayOnly: true},
 }
 
 // ZoneResult 单个 zone 的查询结果。TXT 首版保留字段，始终为空串。
@@ -227,9 +243,13 @@ type CheckOptions struct {
 type CheckResult struct {
 	IP       string
 	Clean    bool
-	HitCount int
-	HitLists []string
-	Zones    []ZoneResult
+	HitCount int      // 仅计参与判定的 RBL 命中数（不含 DisplayOnly）
+	HitLists []string // 同上，仅参与判定的 RBL 名
+	// v0.2.20：仅展示用的 RBL 命中（如 SpamRATS 系列），不参与 Clean 判定。
+	// 用于让 UI 展示与 mxtoolbox 一致的全量命中状态，但不让 Stage A 因云 IP 通病
+	// 一刀切误杀。
+	DisplayOnlyHits []string
+	Zones           []ZoneResult
 }
 
 const (
@@ -328,19 +348,28 @@ func Query(ctx context.Context, ip string, opts CheckOptions) (*CheckResult, err
 
 	cr := &CheckResult{IP: ip, Zones: results}
 	errorCount := 0
+	authoritativeCount := 0
 	for _, r := range results {
 		if r.Hit {
-			cr.HitCount++
-			cr.HitLists = append(cr.HitLists, r.Zone.Name)
+			if r.Zone.DisplayOnly {
+				// v0.2.20：DisplayOnly 命中仅展示给 UI，不算 HitCount 不影响 Clean
+				cr.DisplayOnlyHits = append(cr.DisplayOnlyHits, r.Zone.Name)
+			} else {
+				cr.HitCount++
+				cr.HitLists = append(cr.HitLists, r.Zone.Name)
+			}
 		}
-		if r.Err != nil {
+		if !r.Zone.DisplayOnly {
+			authoritativeCount++
+		}
+		if r.Err != nil && !r.Zone.DisplayOnly {
 			errorCount++
 		}
 	}
 	cr.Clean = cr.HitCount < opts.Threshold
-	if cr.HitCount < opts.Threshold && errorCount > 0 && (errorCount == len(results) || errorCount > len(results)/2) {
+	if cr.HitCount < opts.Threshold && errorCount > 0 && (errorCount == authoritativeCount || errorCount > authoritativeCount/2) {
 		cr.Clean = false
-		return cr, fmt.Errorf("dnsbl 结果不确定：%d/%d 个 zone 查询失败", errorCount, len(results))
+		return cr, fmt.Errorf("dnsbl 结果不确定：%d/%d 个 zone 查询失败", errorCount, authoritativeCount)
 	}
 	return cr, nil
 }
