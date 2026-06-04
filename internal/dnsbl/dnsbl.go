@@ -213,15 +213,14 @@ var DefaultZones = []Zone{
 	{Name: "ixBL", Host: "ix.dnsbl.manitu.net"},
 	// WPBL
 	{Name: "WPBL", Host: "db.wpbl.info"},
-	// v0.2.20：SpamRATS 系列加回。理由：用户实测要求 + NextDNS 能查到（v0.2.17 删因
-	// Cloudflare/Google DoH 经 SpamRATS 限速 RCODE=2 全失败，但 NextDNS 路径通且 0.5s
-	// 内返回）。dohLookup 对 .spamrats.com 域名特殊路由到 NextDNS。
-	// 注：SpamRATS-Dyna 把所有云厂商 IP 段一刀切列为"动态"，对 Gmail/Outlook/Yahoo 投递
-	// 无影响，但用户希望看到 mxtoolbox 一致的结果。
-	{Name: "SpamRATS-All", Host: "all.spamrats.com", DisplayOnly: true},
-	{Name: "SpamRATS-Dyna", Host: "dyna.spamrats.com", DisplayOnly: true},
-	{Name: "SpamRATS-NoPtr", Host: "noptr.spamrats.com", DisplayOnly: true},
-	{Name: "SpamRATS-Spam", Host: "spam.spamrats.com", DisplayOnly: true},
+	// SpamRATS 系列（dohLookup 路由到 NextDNS，Cloudflare/Google 经 SpamRATS 限速失败）
+	// v0.2.20 一度标 DisplayOnly 仅展示，因担心"GCP 全段一刀切"误杀；v0.2.22 实测证明
+	// SpamRATS 是精准命中（同 region 清单里大部分 IP 没命中，少数 IP 命中），用户希望
+	// 命中即剔除。改回参与判定（DisplayOnly=false）。
+	{Name: "SpamRATS-All", Host: "all.spamrats.com"},
+	{Name: "SpamRATS-Dyna", Host: "dyna.spamrats.com"},
+	{Name: "SpamRATS-NoPtr", Host: "noptr.spamrats.com"},
+	{Name: "SpamRATS-Spam", Host: "spam.spamrats.com"},
 }
 
 // ZoneResult 单个 zone 的查询结果。TXT 首版保留字段，始终为空串。
