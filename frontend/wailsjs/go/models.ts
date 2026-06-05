@@ -115,6 +115,7 @@ export namespace deploy {
 	    aliyun_cred_id: string;
 	    hide_client_ip: boolean;
 	    persona_id: string;
+	    root_domain_map: Record<string, string>;
 	    deploy_type: string;
 	    mail_user: string;
 	
@@ -128,6 +129,7 @@ export namespace deploy {
 	        this.aliyun_cred_id = source["aliyun_cred_id"];
 	        this.hide_client_ip = source["hide_client_ip"];
 	        this.persona_id = source["persona_id"];
+	        this.root_domain_map = source["root_domain_map"];
 	        this.deploy_type = source["deploy_type"];
 	        this.mail_user = source["mail_user"];
 	    }

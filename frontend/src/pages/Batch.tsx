@@ -169,6 +169,10 @@ export default function Batch() {
   // v0.2.19：邮箱账号 local-part（默认 info），仅 [a-z0-9._-]
   const [mailUser, setMailUser] = useState<string>('info')
   const [domainIPText, setDomainIPText] = useState('')
+  // v0.2.25：每个根域分几台 VPS（用户场景 30 台 / 10 域 = 3）
+  const [vpsPerDomain, setVpsPerDomain] = useState<number>(1)
+  // 子域命名模式：{N} 占位会被 1..vpsPerDomain 替换。@/空 = 直接用根域（仅 vpsPerDomain=1 时）
+  const [subdomainPattern, setSubdomainPattern] = useState<string>('mail{N}')
   const [aliID, setAliID] = useState('')
 
   const appendLog = (setter: React.Dispatch<React.SetStateAction<LogLine[]>>) => (data: any) => {
@@ -416,24 +420,49 @@ export default function Batch() {
       .filter(l => l.length > 0 && !l.startsWith('#'))
       .filter(l => l.includes('.') && !l.startsWith('.') && !l.endsWith('.'))
 
-  // 按顺序把域名和本批次 VPS IP 配对
-  const buildDomainIPMap = (): { map: Record<string, string>; pairs: Array<{ domain: string; ip: string }>; extraDomains: string[]; extraVPS: Array<{ ip: string; name: string }> } => {
-    const domains = parseDomains(domainIPText)
+  // v0.2.25：根域 × VPS 数 → 展开 FQDN（mail1.根域、mail2.根域…）配对 VPS IP。
+  //
+  // 展开模式（subdomainPattern）：
+  //   - "@"        每个 VPS 一个根域名（旧行为，vpsPerDomain 必须为 1）
+  //   - "mail{N}"  N 从 1 开始递增，展开 mail1.根域 / mail2.根域 / ...
+  //
+  // 例：根域 ['a.com', 'b.com']，vpsPerDomain=3，pattern="mail{N}"
+  //   FQDN 序列 = [mail1.a.com, mail2.a.com, mail3.a.com, mail1.b.com, mail2.b.com, mail3.b.com]
+  //   按 readyVPS 顺序配对。
+  const buildDomainIPMap = (): { map: Record<string, string>; rootMap: Record<string, string>; pairs: Array<{ domain: string; ip: string }>; extraDomains: string[]; extraVPS: Array<{ ip: string; name: string }> } => {
+    const roots = parseDomains(domainIPText)
     const readyVPS = batchVPS.filter(v => v.ip && v.deploy_status === 'vps_running')
+    // 展开 FQDN
+    const fqdns: string[] = []
+    const fqdnRoot: Record<string, string> = {}
+    const per = Math.max(1, vpsPerDomain)
+    for (const root of roots) {
+      for (let i = 1; i <= per; i++) {
+        let fqdn: string
+        if (per === 1 && subdomainPattern.trim() === '@') {
+          fqdn = root // 旧行为：单 VPS 用根域
+        } else {
+          const sub = subdomainPattern.replace(/\{N\}/g, String(i)).trim()
+          fqdn = sub === '' || sub === '@' ? root : `${sub}.${root}`
+        }
+        fqdns.push(fqdn)
+        fqdnRoot[fqdn] = root
+      }
+    }
     const pairs: Array<{ domain: string; ip: string }> = []
     const map: Record<string, string> = {}
-    const n = Math.min(domains.length, readyVPS.length)
+    const n = Math.min(fqdns.length, readyVPS.length)
     for (let i = 0; i < n; i++) {
-      pairs.push({ domain: domains[i], ip: readyVPS[i].ip })
-      map[domains[i]] = readyVPS[i].ip
+      pairs.push({ domain: fqdns[i], ip: readyVPS[i].ip })
+      map[fqdns[i]] = readyVPS[i].ip
     }
-    const extraDomains = domains.slice(n)
+    const extraDomains = fqdns.slice(n)
     const extraVPS = readyVPS.slice(n).map(v => ({ ip: v.ip, name: v.name }))
-    return { map, pairs, extraDomains, extraVPS }
+    return { map, rootMap: fqdnRoot, pairs, extraDomains, extraVPS }
   }
 
   const confirmStageC = async () => {
-    const { map, pairs, extraDomains, extraVPS } = buildDomainIPMap()
+    const { map, rootMap, pairs, extraDomains, extraVPS } = buildDomainIPMap()
     if (pairs.length === 0) {
       toast('warning', '请至少填写 1 个域名，且本批次至少有 1 台 vps_running 的 VPS')
       return
@@ -451,6 +480,7 @@ export default function Batch() {
       setBatchProgress({ total: pairs.length, succeeded: 0, failed: 0, status: 'stage-c-running' })
       const taskID = await StartStageC({
         domain_ip_map: map,
+        root_domain_map: rootMap,
         aliyun_cred_id: aliID,
         hide_client_ip: hideClientIP,
         deploy_type: deployTypeSel,
@@ -1009,6 +1039,37 @@ export default function Batch() {
                 onChange={e => setDomainIPText(e.target.value)}
                 placeholder={'example1.com\nexample2.com\nexample3.com\n# 以 # 开头的行会被忽略'}
               />
+              <div className="text-[11px] text-slate-500 mt-1">
+                每行一个<span className="text-slate-300">根域名</span>。下方"每域 VPS 数"&gt;1 时软件自动展开成 mail1./mail2./...
+              </div>
+            </div>
+
+            {/* v0.2.25：每域 VPS 数 + 子域命名模式 */}
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">每域 VPS 数</label>
+                <input type="number" min={1} max={50}
+                       className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
+                       value={vpsPerDomain}
+                       onChange={e => setVpsPerDomain(Math.max(1, Math.min(50, Number(e.target.value) || 1)))} />
+                <div className="text-[10px] text-slate-500 mt-0.5">
+                  10 个根域 × 3 = 30 个 FQDN
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">子域命名（{`{N}`} 替换为 1..N）</label>
+                <input type="text"
+                       className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm font-mono focus:border-indigo-500 outline-none"
+                       value={subdomainPattern}
+                       disabled={vpsPerDomain <= 1}
+                       placeholder="mail{N}"
+                       onChange={e => setSubdomainPattern(e.target.value.toLowerCase().replace(/[^a-z0-9.\-_{}n]/g, '').slice(0, 30))} />
+                <div className="text-[10px] text-slate-500 mt-0.5">
+                  {vpsPerDomain <= 1
+                    ? '（每域 1 台时直接用根域，不加前缀）'
+                    : `示例 FQDN: ${subdomainPattern.replace(/\{N\}/g, '1')}.example.com / ${subdomainPattern.replace(/\{N\}/g, '2')}.example.com ...`}
+                </div>
+              </div>
             </div>
 
             {/* 实时 preview：域名 → IP 配对预览 */}

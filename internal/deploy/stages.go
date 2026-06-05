@@ -52,6 +52,11 @@ type StageCRequest struct {
 	AliyunCredID string            `json:"aliyun_cred_id"`
 	HideClientIP bool              `json:"hide_client_ip"`
 	PersonaID    string            `json:"persona_id"`
+	// v0.2.25：每个 FQDN 对应的根域名（用户场景：10 个根域 × 3 个 VPS = 30 个 FQDN，
+	// 形如 mail1.example.com → 根域 example.com）。空时各 FQDN 默认根域 = FQDN 自身
+	// （兼容老版本逐域逐 VPS 模型）。后端用 SubdomainFromFQDN(fqdn, rootDomain) 反推
+	// subdomain。
+	RootDomainMap map[string]string `json:"root_domain_map"`
 	// v0.2.9：第三步当场选的部署方式，覆盖模板默认。空=跟随各 VPS 模板的 deploy_type；
 	// "kumomta"/"postfix"=本批统一用该方式（postfix/mailcow 仅单 NIC，多 NIC 自动回退 kumomta）。
 	DeployType string `json:"deploy_type"`
@@ -1074,14 +1079,28 @@ func StartStageCWithPersona(ctx context.Context, req StageCRequest, personaSpec 
 					atomic.AddInt64(&state.failed, 1)
 					return
 				}
+				// v0.2.25：d 是 FQDN（mail1.example.com 或纯根域 example.com），rootDomain
+				// 从 RootDomainMap 取；空时退化为 d 自身（兼容老版本）。SubdomainFromFQDN
+				// 反推子域名：mail1.example.com - example.com → "mail1"；FQDN==rootDomain
+				// → "@"。
 				fqdn := d
+				rootDomain := req.RootDomainMap[d]
+				if rootDomain == "" {
+					rootDomain = d
+				}
+				subdomain := SubdomainFromFQDN(fqdn, rootDomain)
 				_, _ = db.ExecContext(runCtx,
 					`UPDATE vps_instances SET domain=?, fqdn=?, aliyun_cred_id=?, deploy_status='mta_deploying', persona_id=?, hide_client_ip=? WHERE id=?`,
-					d, fqdn, req.AliyunCredID, req.PersonaID, boolToInt(req.HideClientIP), vpsID)
-				if err := upsertAliyunRecordAndSyncLocal(runCtx, db, aliyunDNS, req.AliyunCredID, d, vpsID, dns.DnsRecordSpec{RR: "@", RecordType: "A", Value: ip}, logC); err != nil {
+					rootDomain, fqdn, req.AliyunCredID, req.PersonaID, boolToInt(req.HideClientIP), vpsID)
+				// A 记录：subdomain="@" → 根域 A；subdomain="mail1" → mail1.根域 A
+				aRR := subdomain
+				if subdomain == "@" {
+					aRR = "@"
+				}
+				if err := upsertAliyunRecordAndSyncLocal(runCtx, db, aliyunDNS, req.AliyunCredID, rootDomain, vpsID, dns.DnsRecordSpec{RR: aRR, RecordType: "A", Value: ip}, logC); err != nil {
 					logC("WARN", "UpsertRecord A 失败: %v", err)
 				}
-				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, "@", d, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID, DeployType: req.DeployType, MailUser: req.MailUser}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
+				if err := deployMTAOnVPS(runCtx, vpsID, ip, internalIP, fqdn, subdomain, rootDomain, rootPwd, DeployOpts{HideClientIP: req.HideClientIP, PersonaID: req.PersonaID, DeployType: req.DeployType, MailUser: req.MailUser}, personaSpec, aliyunDNS, req.AliyunCredID, logC); err != nil {
 					logC("ERROR", "部署 KumoMTA 失败: %v", err)
 					_, _ = db.Exec(`UPDATE vps_instances SET deploy_status='failed', deploy_error=? WHERE id=?`, err.Error(), vpsID)
 					atomic.AddInt64(&state.failed, 1)
