@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.25**（`version.txt`；Stage C 多 VPS 共享根域，自动展开 mail1./mail2./...）
+> 当前版本：**v0.2.26**（`version.txt`；vpsPerDomain 默认自动填满 = ceil(VPS/根域)）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.25** | 最新。**Stage C 多 VPS 共享根域**：用户场景 30 台 VPS 但只有 10 个域名，需自动分配 mail1./mail2./mail3. 子域。前端 Batch.tsx Stage C 弹窗加"每域 VPS 数"输入（默认 1）+"子域命名模式"输入（默认 `mail{N}`，`{N}`=1..N）；buildDomainIPMap 按 roots × per 展开 FQDN list（如 mail1.a.com / mail2.a.com / mail3.a.com / mail1.b.com / ...）配对 VPS IP。后端 StageCRequest 加 `RootDomainMap map[string]string`（FQDN→根域），Stage C 主循环用 `SubdomainFromFQDN(fqdn, rootDomain)` 反推子域；落库 `domain=rootDomain, fqdn=完整FQDN`；A 记录 `RR=subdomain` 而非硬编码 `@`；DKIM/SPF/MX/DMARC 由 `DNSRRsForSubdomain` 自动适配子域（早就支持）。空 RootDomainMap 时退化为 fqdn==rootDomain，完全兼容老版本逐域逐 VPS |
+| **v0.2.26** | 最新。**vpsPerDomain 默认自动填满**：v0.2.25 加了"每域 VPS 数"输入但默认 1，用户输 1 个根域时不会自动展开 N 子域，需手动改。本版加 `autoFillVpsPerDomain` 在 textarea onChange 时算 `ceil(readyVPS/根域数)` 自动填；用户主动改 input 后置 `vpsPerDomainTouched=true` 停止自动填。30 VPS / 1 域 → 自动 30；30 VPS / 10 域 → 自动 3 |
+| v0.2.25 | **Stage C 多 VPS 共享根域**：用户场景 30 台 VPS 但只有 10 个域名，需自动分配 mail1./mail2./mail3. 子域。前端 Batch.tsx Stage C 弹窗加"每域 VPS 数"输入（默认 1）+"子域命名模式"输入（默认 `mail{N}`，`{N}`=1..N）；buildDomainIPMap 按 roots × per 展开 FQDN list（如 mail1.a.com / mail2.a.com / mail3.a.com / mail1.b.com / ...）配对 VPS IP。后端 StageCRequest 加 `RootDomainMap map[string]string`（FQDN→根域），Stage C 主循环用 `SubdomainFromFQDN(fqdn, rootDomain)` 反推子域；落库 `domain=rootDomain, fqdn=完整FQDN`；A 记录 `RR=subdomain` 而非硬编码 `@`；DKIM/SPF/MX/DMARC 由 `DNSRRsForSubdomain` 自动适配子域（早就支持）。空 RootDomainMap 时退化为 fqdn==rootDomain，完全兼容老版本逐域逐 VPS |
 | v0.2.24 | **亚洲多区域并发筛 IP**：用户需求"日本+韩国+新加坡+台湾一键都筛"。后端 stages.go region 白名单扩到 7 个（asia-northeast1/2/3 + asia-east1/2 + asia-southeast1/2）；**worker 改固定绑定 region**（按 workerID 分配），不再 v0.2.14 那种 attempt 轮询——这样每个 region 池被独立 worker 持续撑满各自 175 配额，hold 翻新机制单池生效；concurrency 自动 ≥ len(regions)×2 保证每区至少 2 worker，硬上限 20；claimSlot 仍全局抢（哪区先有干净 IP 先填）。前端 Batch.tsx Step 1 改 checkbox 多选（默认勾首尔），每项显示池前缀特征 + 国旗 emoji。req.Regions 字段已存在（v0.2.14 用过被回退）现复用 |
 | v0.2.23 | **修 Site Verification API URL 大小写**：v0.2.21 用 `/siteverification/v1/`（全小写）调 Google API 全部返回 HTTP 404 "URL not found"。Google REST API 路径**区分大小写**——正确为 `/siteVerification/v1/`（大 V）。一处 const 改正后，GetVerifyToken/InsertWebResource/IsDomainVerified 三个方法全部能正常调用 |
 | v0.2.22 | **SpamRATS 改回参与判定**：v0.2.20 一度标 DisplayOnly 仅展示，因担心"GCP 全段一刀切误杀"；用户实测筛 IP 清单证明 SpamRATS 是**精准命中**（同 region 大部分 IP 没命中，少数命中），用户希望"命中即剔除"。把 4 个 SpamRATS RBL 的 DisplayOnly 标志去掉，命中纳入 HitLists/HitCount，verdict=dirty 直接 holdDirty 跳过该 IP。DisplayOnly 机制保留（未来某 RBL 可能用），但当前无 RBL 使用。Stage A 清单里不会再出现 [display:SpamRATS-...] 标记的 clean IP |

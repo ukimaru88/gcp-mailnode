@@ -171,8 +171,22 @@ export default function Batch() {
   const [domainIPText, setDomainIPText] = useState('')
   // v0.2.25：每个根域分几台 VPS（用户场景 30 台 / 10 域 = 3）
   const [vpsPerDomain, setVpsPerDomain] = useState<number>(1)
+  // v0.2.26：用户手动改过 vpsPerDomain 后停止自动填（避免覆盖用户意图）
+  const [vpsPerDomainTouched, setVpsPerDomainTouched] = useState(false)
   // 子域命名模式：{N} 占位会被 1..vpsPerDomain 替换。@/空 = 直接用根域（仅 vpsPerDomain=1 时）
   const [subdomainPattern, setSubdomainPattern] = useState<string>('mail{N}')
+
+  // v0.2.26：自动算 vpsPerDomain = ceil(readyVPS / 根域数)，让用户输入根域后软件自动
+  // 把 N 台 VPS 平均分到所有根域。用户主动改过 input 则停止自动填。
+  const autoFillVpsPerDomain = (text: string) => {
+    if (vpsPerDomainTouched) return
+    const roots = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#') && l.includes('.') && !l.startsWith('.') && !l.endsWith('.'))
+    const vpsCount = batchVPS.filter(v => v.ip && v.deploy_status === 'vps_running').length
+    if (roots.length > 0 && vpsCount > 0) {
+      const auto = Math.max(1, Math.ceil(vpsCount / roots.length))
+      setVpsPerDomain(auto)
+    }
+  }
   const [aliID, setAliID] = useState('')
 
   const appendLog = (setter: React.Dispatch<React.SetStateAction<LogLine[]>>) => (data: any) => {
@@ -1036,7 +1050,7 @@ export default function Batch() {
                 className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-xs font-mono focus:border-indigo-500 outline-none"
                 rows={8}
                 value={domainIPText}
-                onChange={e => setDomainIPText(e.target.value)}
+                onChange={e => { setDomainIPText(e.target.value); autoFillVpsPerDomain(e.target.value) }}
                 placeholder={'example1.com\nexample2.com\nexample3.com\n# 以 # 开头的行会被忽略'}
               />
               <div className="text-[11px] text-slate-500 mt-1">
@@ -1051,7 +1065,7 @@ export default function Batch() {
                 <input type="number" min={1} max={50}
                        className="w-full bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1.5 text-sm focus:border-indigo-500 outline-none"
                        value={vpsPerDomain}
-                       onChange={e => setVpsPerDomain(Math.max(1, Math.min(50, Number(e.target.value) || 1)))} />
+                       onChange={e => { setVpsPerDomain(Math.max(1, Math.min(50, Number(e.target.value) || 1))); setVpsPerDomainTouched(true) }} />
                 <div className="text-[10px] text-slate-500 mt-0.5">
                   10 个根域 × 3 = 30 个 FQDN
                 </div>
