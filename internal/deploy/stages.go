@@ -99,20 +99,36 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 	if _, err := loadTemplate(req.TemplateID); err != nil {
 		return "", err
 	}
-	// v0.2.16：region 改为前端可选（默认东京）。实测发现：
-	//   - 东京 asia-northeast1：当前池 100% 是 34./35.（cmd/ippool 验证 150/150）
-	//   - 大阪 asia-northeast2：100% 是 34.97 段
-	//   - 韩国 asia-northeast3：18% 是 8.230.x 段（27/150 命中非 34./35.）★
-	// 用户要避开 34./35. 时选首尔，业务强制日本时选东京。多区域并发是负优化
-	// （v0.2.14 实测：worker 分流稀释 hold，反而破坏 dirtyIPHolder "占满池触发翻新"机制），
-	// 所以前端给单选不是多选；req.Regions 仍是 slice 兼容多 NIC 设计但实际用第一个。
-	// 静态 IP 是 region 绑定，多 NIC 所有 IP 必须同 region；同 batch 锁单 region 避免漂移。
-	regions := []string{"asia-northeast1"}
+	// v0.2.24：亚洲多区域筛选（用户可多选）。
+	// 关键设计：每个 worker 启动时**固定绑定一个 region**，而不是 v0.2.14 的轮询分流。
+	// v0.2.14 失败原因：worker 平均分流 → 每个 region 池都只撑到 ~87/175，hold 翻新失效。
+	// v0.2.24 修正：worker 按 workerID 固定 region，每个 region 持续被独立 worker 撑满
+	// 自己的 175 池，多个池子并行翻新；claimSlot 全局抢，哪个 region 先找到干净 IP 先填。
+	//
+	// 支持区域（GCP 亚洲）：
+	//   - asia-northeast1 东京   34./35.（pool 100%，避不开）
+	//   - asia-northeast2 大阪   34.97（pool 100%）
+	//   - asia-northeast3 首尔   ★ 8.230.x 段约 18%（推荐避开 34./35.）
+	//   - asia-east1 台湾彰化     未实测
+	//   - asia-east2 香港        未实测
+	//   - asia-southeast1 新加坡 未实测
+	//   - asia-southeast2 印尼   未实测
+	allowedRegions := map[string]bool{
+		"asia-northeast1": true, "asia-northeast2": true, "asia-northeast3": true,
+		"asia-east1": true, "asia-east2": true,
+		"asia-southeast1": true, "asia-southeast2": true,
+	}
+	regions := []string{"asia-northeast1"} // 默认
 	if len(req.Regions) > 0 {
-		first := strings.TrimSpace(req.Regions[0])
-		switch first {
-		case "asia-northeast1", "asia-northeast2", "asia-northeast3":
-			regions = []string{first}
+		filtered := make([]string, 0, len(req.Regions))
+		for _, r := range req.Regions {
+			r = strings.TrimSpace(r)
+			if allowedRegions[r] {
+				filtered = append(filtered, r)
+			}
+		}
+		if len(filtered) > 0 {
+			regions = filtered
 		}
 	}
 	if onLog == nil {
@@ -206,6 +222,14 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 		if concurrency > 20 {
 			concurrency = 20
 		}
+		// v0.2.24：多 region 时保证每个 region 至少 2 worker（独立撑满各自池）。
+		// 用户选 5 region 但 Count=5，concurrency 至少要 10（每 region 2 worker）。
+		if minPerRegion := len(regions) * 2; concurrency < minPerRegion {
+			concurrency = minPerRegion
+		}
+		if concurrency > 20 {
+			concurrency = 20 // 最终硬上限，避免 GCP API 速率超
+		}
 		// MaxRetryPerSlot=0 表示"无限循环直到达到目标 N 或全部 region 配额耗尽或用户取消"
 		// 非零时，总尝试上限 = N * MaxRetryPerSlot（防误触烧钱）
 		var maxTotalAttempts int64 = 0
@@ -287,7 +311,10 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 
 				attempt := atomic.LoadInt64(&totalAttempts)
 				gcpCredID := req.GCPCredIDs[int(attempt-1)%len(req.GCPCredIDs)]
-				region := regions[int(attempt-1)%len(regions)]
+				// v0.2.24：worker 固定 region（按 workerID 分配），不再按 attempt 轮询。
+				// 这样每个 region 池被独立 worker 持续撑满（hold 到顶 175），翻新机制
+				// 单池独立生效，多 region 并行各筛各的；claimSlot 全局抢。
+				region := regions[(workerID-1)%len(regions)]
 
 				if v, blown := exhausted.Load(region); blown {
 					until := v.(time.Time)

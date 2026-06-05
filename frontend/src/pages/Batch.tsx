@@ -143,7 +143,8 @@ export default function Batch() {
   // v0.2.4：跳过 DNSBL 检测开关，默认关闭（保持严格审查）
   const [skipDNSBL, setSkipDNSBL] = useState(false)
   // v0.2.16：region 单选。东京当前池 100% 是 34./35.，首尔 18% 是 8.230.x（实测）
-  const [selectedRegion, setSelectedRegion] = useState<string>('asia-northeast1')
+  // v0.2.24：多区域可选（亚洲 7 个 GCP 区域），首尔默认勾选（实测 18% 非 34./35.）
+  const [selectedRegions, setSelectedRegions] = useState<string[]>(['asia-northeast3'])
   const [batchProgress, setBatchProgress] = useState<{ total: number; succeeded: number; failed: number; status: string } | null>(null)
   const batchStatus = batchProgress?.status || ''
   const [progressStartAt, setProgressStartAt] = useState<number>(0)
@@ -327,7 +328,7 @@ export default function Batch() {
       gcp_cred_ids: [gcps[0].id],
       template_id: tplA,
       count: totalIPs,
-      regions: [selectedRegion],
+      regions: selectedRegions.length > 0 ? selectedRegions : ['asia-northeast1'],
       dnsbl_threshold: dnsblTh,
       max_retry_per_slot: maxRetry,
       ip_prefix_filter: [],
@@ -578,21 +579,43 @@ export default function Batch() {
 
               <div className="text-xs text-slate-400 bg-slate-900/40 border border-slate-700/40 rounded-md px-3 py-2 leading-relaxed">
                 <div>使用账号：<span className="text-indigo-300">{gcps[0]?.name || '（无可用 GCP 凭证）'}</span></div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span>区域：</span>
-                  <select className="bg-slate-900 border border-slate-700 text-slate-100 rounded-md px-2 py-1 text-xs focus:border-indigo-500 outline-none"
-                          value={selectedRegion} onChange={e => setSelectedRegion(e.target.value)}>
-                    <option value="asia-northeast1">日本东京 asia-northeast1（当前池 ≈100% 是 34./35.）</option>
-                    <option value="asia-northeast2">日本大阪 asia-northeast2（实测 100% 是 34.97）</option>
-                    <option value="asia-northeast3">韩国首尔 asia-northeast3（约 18% 是 8.230.x，避开 34./35. 推荐 ⭐）</option>
-                  </select>
-                </div>
-                <div className="text-[11px] text-slate-500 mt-0.5">
-                  {selectedRegion === 'asia-northeast3'
-                    ? '⭐ 首尔池有 8.230.x 段（约 18% 命中），适合排除 34./35. 的场景。韩国到日本邮箱网络 ~50ms。'
-                    : selectedRegion === 'asia-northeast2'
-                      ? '⚠️ 大阪池实测全是 34.97 段，排除 34./35. 时无法筛出。'
-                      : '⚠️ 东京池当前 100% 是 34./35.，排除时筛不出非主力段（除非池子换轮）。'}
+                <div>
+                  <div className="mb-1">区域（亚洲 7 选 N，多选并发筛各自池）：</div>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-1.5">
+                    {([
+                      { v: 'asia-northeast1', label: '🇯🇵 日本东京', tip: '池 ≈100% 是 34./35.' },
+                      { v: 'asia-northeast2', label: '🇯🇵 日本大阪', tip: '池 100% 是 34.97' },
+                      { v: 'asia-northeast3', label: '🇰🇷 韩国首尔 ⭐', tip: '18% 是 8.230.x' },
+                      { v: 'asia-east1', label: '🇹🇼 台湾彰化', tip: '未实测' },
+                      { v: 'asia-east2', label: '🇭🇰 香港', tip: '未实测' },
+                      { v: 'asia-southeast1', label: '🇸🇬 新加坡', tip: '未实测' },
+                      { v: 'asia-southeast2', label: '🇮🇩 印尼雅加达', tip: '未实测' },
+                    ] as const).map(r => {
+                      const checked = selectedRegions.includes(r.v)
+                      return (
+                        <label key={r.v}
+                               className={`flex items-start gap-1.5 px-2 py-1 rounded border text-[11px] cursor-pointer transition-colors ${
+                                 checked
+                                   ? 'bg-indigo-500/15 border-indigo-500/50 text-indigo-200'
+                                   : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'
+                               }`}>
+                          <input type="checkbox" className="accent-indigo-500 mt-0.5"
+                                 checked={checked}
+                                 onChange={e => {
+                                   if (e.target.checked) setSelectedRegions([...selectedRegions, r.v])
+                                   else setSelectedRegions(selectedRegions.filter(x => x !== r.v))
+                                 }} />
+                          <div className="flex-1">
+                            <div className="font-medium">{r.label}</div>
+                            <div className="text-[10px] text-slate-500">{r.v} · {r.tip}</div>
+                          </div>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  <div className="text-[10px] text-amber-400 mt-1.5">
+                    💡 每个 worker 固定绑定一个 region 持续撑满各自池（v0.2.14 平均分流的负优化已修）。已选 <span className="font-mono text-indigo-300">{selectedRegions.length || 1}</span> 个区域，并发 worker 自动 ≥ {(selectedRegions.length || 1) * 2}。
+                  </div>
                 </div>
                 <div>IP 前缀：<span className="text-indigo-300">不过滤</span>（仅 DNSBL）</div>
               </div>
