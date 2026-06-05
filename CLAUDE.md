@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.22**（`version.txt`；SpamRATS 改回参与判定，命中即剔除）
+> 当前版本：**v0.2.23**（`version.txt`；修 Site Verification API URL 大小写 HTTP 404）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.22** | 最新。**SpamRATS 改回参与判定**：v0.2.20 一度标 DisplayOnly 仅展示，因担心"GCP 全段一刀切误杀"；用户实测筛 IP 清单证明 SpamRATS 是**精准命中**（同 region 大部分 IP 没命中，少数命中），用户希望"命中即剔除"。把 4 个 SpamRATS RBL 的 DisplayOnly 标志去掉，命中纳入 HitLists/HitCount，verdict=dirty 直接 holdDirty 跳过该 IP。DisplayOnly 机制保留（未来某 RBL 可能用），但当前无 RBL 使用。Stage A 清单里不会再出现 [display:SpamRATS-...] 标记的 clean IP |
+| **v0.2.23** | 最新。**修 Site Verification API URL 大小写**：v0.2.21 用 `/siteverification/v1/`（全小写）调 Google API 全部返回 HTTP 404 "URL not found"。Google REST API 路径**区分大小写**——正确为 `/siteVerification/v1/`（大 V）。一处 const 改正后，GetVerifyToken/InsertWebResource/IsDomainVerified 三个方法全部能正常调用 |
+| v0.2.22 | **SpamRATS 改回参与判定**：v0.2.20 一度标 DisplayOnly 仅展示，因担心"GCP 全段一刀切误杀"；用户实测筛 IP 清单证明 SpamRATS 是**精准命中**（同 region 大部分 IP 没命中，少数命中），用户希望"命中即剔除"。把 4 个 SpamRATS RBL 的 DisplayOnly 标志去掉，命中纳入 HitLists/HitCount，verdict=dirty 直接 holdDirty 跳过该 IP。DisplayOnly 机制保留（未来某 RBL 可能用），但当前无 RBL 使用。Stage A 清单里不会再出现 [display:SpamRATS-...] 标记的 clean IP |
 | v0.2.21 | **GCP 域名所有权自动验证**：用户报 Auto-PTR 失败 `Invalid value for 'publicPtrDomainName': 'zobetype.net'. Please verify ownership of the PTR domain`。根因 GCP 自 2023 起强制要求 PTR 域名所有权验证。新增 `internal/gcp/siteverify.go` 集成 Google Site Verification REST API（v1）：`GetVerifyToken` 拿 `google-site-verification=xxx` token、`InsertWebResource` 完成验证、`IsDomainVerified` 复查。stages.go 新增 `ensureDomainVerified` 流程：缓存命中 → 跳过；否则 GetVerifyToken → 阿里云 DNS AddRecord TXT @（不用 Upsert 避免覆盖 SPF）→ 等 60s 传播 → Google InsertWebResource。`sync.Map` 缓存已验证域名，`sync.Mutex` 串行化同域名并发。autoSetPTRForSupportedNICs 在调 SetInstancePTR 前自动验证。失败时友好提示（SA 缺权限/API 未启用/DNS 不在阿里云）但不阻断流程。**前提：项目需启用 Site Verification API + SA 加权限** |
 | v0.2.20 | **SpamRATS RBL 加回 + DisplayOnly 设计**：用户实测要求 RBL 检测包含 SpamRATS-Dyna。实测 10 个 DoH 服务商发现 Cloudflare/Google/Quad9/AdGuard/AliDNS 等查 SpamRATS 全 RCODE=2/超时失败（SpamRATS 限速这些公网递归），**唯独 NextDNS 0.5s 返回 LISTED**。改动：① Zone 加 `DisplayOnly bool` 字段；CheckResult 加 `DisplayOnlyHits []string`，HitCount/HitLists 不计 DisplayOnly 命中，errorCount/Clean 判定也跳过；UI 仍能看到命中 ② dohLookup 路由：`.spamrats.com` 域名走 `dohEndpointsSpamRATS=[dns.nextdns.io]`，其他走 Cloudflare/Google ③ SpamRATS 4 个全标 DisplayOnly=true（云 IP 通病：所有 GCP/AWS/Azure 段一刀切列入，对 Gmail/Outlook/Yahoo 投递无影响）④ Stage A 日志带 `[仅展示命中 SpamRATS-Dyna]` 提示；DB hit_lists 字段加 `[display:...]` 前缀供前端展示 |
 | v0.2.19 | **Stage C 自定义邮箱账号前缀**：之前所有部署的账号硬编码 `info@根域`，用户需要 `sales/hello/contact/no-reply` 等场景无法切换。改动：① templates.go 新增 `SanitizeMailUser`（[a-z0-9._-]，1-32 字符，不能以点/连字符首尾）+ `DeployVars.OverrideMailUser` 方法 ② render() 加 `{MAIL_USER_LOCAL}` 占位符（从 v.Username 取 @ 前缀） ③ install_mailcow.sh 把硬编码 `info` 改占位符（postfix/kumomta 已自动跟随 Username） ④ StageCRequest + DeployOpts 加 MailUser 字段，3 个 deploy 函数透传 ⑤ Batch.tsx Stage C 弹窗加输入框，实时显示账号预览，前端做字符过滤兜底。空值/非法回退 info |

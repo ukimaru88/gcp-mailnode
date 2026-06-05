@@ -31,7 +31,9 @@ import (
 	"golang.org/x/oauth2"
 )
 
-const siteVerifyBase = "https://www.googleapis.com/siteverification/v1"
+// v0.2.23：Google Site Verification API URL 路径区分大小写 — 必须 `siteVerification`（大 V）。
+// v0.2.21 用全小写 /siteverification/ 返回 404 "URL not found"。
+const siteVerifyBase = "https://www.googleapis.com/siteVerification/v1"
 
 // SiteVerifyClient 用 SA token source 调 Google Site Verification REST API。
 type SiteVerifyClient struct {
