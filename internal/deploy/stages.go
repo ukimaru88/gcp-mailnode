@@ -1580,9 +1580,8 @@ chmod +x /tmp/deploy_config.sh
 			{RR: rrs.MX, RecordType: "MX", Value: fqdn, Priority: &mxPriority},
 			{RR: rrs.SPF, RecordType: "TXT", Value: spfValue},
 			{RR: rrs.DMARC, RecordType: "TXT", Value: fmt.Sprintf("v=DMARC1; p=reject; rua=mailto:dmarc@%s", domain)},
-			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→主 NIC IP；
-			// 多 NIC 模式下也只指向主 IP，多个 IP 通过 mail1..mailN 子域分散
-			{RR: "smtp", RecordType: "A", Value: ip},
+			// v0.2.27：子域模式下 RR=smtp.子域 而非硬编码 smtp（之前 mail1.根域 缺 smtp.mail1.根域 A）
+			{RR: SMTPEntryRR(subdomain), RecordType: "A", Value: ip},
 		}
 		// v0.1.57：多 NIC 时 mail1~mailN A 记录指向各自 IP（Received 链 / EHLO 三方匹配的关键）
 		if len(allIPs) > 1 {
@@ -1734,6 +1733,17 @@ func autoSetPTRForSupportedNICs(ctx context.Context, db *sql.DB, vpsID, ip, fqdn
 					log("WARN", "auto-PTR：② 项目未启用 Site Verification API → https://console.cloud.google.com/apis/library/siteverification.googleapis.com")
 					log("WARN", "auto-PTR：③ 域名 DNS 未在阿里云托管或权限不足")
 					// 不阻断 —— 让 SetInstancePTR 继续尝试，失败时 v0.1.75 已有反向校验和告警
+				}
+				// v0.2.27：顺带补建 SMTP 入口 A 记录（之前 v0.2.27 之前部署的子域 VPS 漏建
+				// smtp.子域.根域 A）。UpsertRecord 幂等（值相同跳过），新部署 Stage C 已建
+				// 这里也是 no-op；老部署补建一次就齐了。
+				subdomain := SubdomainFromFQDN(fqdn, rootDomain)
+				smtpRR := SMTPEntryRR(subdomain)
+				smtpSpec := dns.DnsRecordSpec{RR: smtpRR, RecordType: "A", Value: ip}
+				if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliDNS, aliyunCredID, rootDomain, vpsID, smtpSpec, log); err != nil {
+					log("WARN", "顺带补建 %s.%s A 失败: %v", smtpRR, rootDomain, err)
+				} else {
+					log("INFO", "✅ SMTP 入口 A 已确保: %s.%s → %s", smtpRR, rootDomain, ip)
 				}
 			}
 		}
@@ -1940,8 +1950,8 @@ func deployPostfixOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdom
 			{RR: rrs.MX, RecordType: "MX", Value: fqdn, Priority: &mxPriority},
 			{RR: rrs.SPF, RecordType: "TXT", Value: fmt.Sprintf("v=spf1 ip4:%s -all", ip)},
 			{RR: rrs.DMARC, RecordType: "TXT", Value: fmt.Sprintf("v=DMARC1; p=reject; rua=mailto:dmarc@%s", domain)},
-			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→server_ip
-			{RR: "smtp", RecordType: "A", Value: ip},
+			// v0.2.27：子域模式下 RR=smtp.子域（之前硬编码 smtp 漏建 smtp.子域.根域 A）
+			{RR: SMTPEntryRR(subdomain), RecordType: "A", Value: ip},
 		}
 		for _, spec := range records {
 			if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliyunDNS, aliyunCredID, domain, vpsID, spec, log); err != nil {
@@ -1997,8 +2007,8 @@ func deployMailcowOnVPS(ctx context.Context, db *sql.DB, vpsID, ip, fqdn, subdom
 			// autodiscover / autoconfig 让邮件大师等客户端自动配置
 			{RR: "autodiscover", RecordType: "CNAME", Value: fqdn},
 			{RR: "autoconfig", RecordType: "CNAME", Value: fqdn},
-			// v0.2.6：mail-toolkit 约定的 SMTP 入口 smtp.根域 A→server_ip
-			{RR: "smtp", RecordType: "A", Value: ip},
+			// v0.2.27：子域模式下 RR=smtp.子域（之前硬编码 smtp 漏建 smtp.子域.根域 A）
+			{RR: SMTPEntryRR(subdomain), RecordType: "A", Value: ip},
 		}
 		for _, spec := range records {
 			if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliyunDNS, aliyunCredID, domain, vpsID, spec, log); err != nil {

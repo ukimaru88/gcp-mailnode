@@ -50,6 +50,17 @@ func DNSRRsForSubdomain(subdomain string) mailDNSRRs {
 	}
 }
 
+// SMTPEntryRR 计算 mail-toolkit 约定的 SMTP 入口 A 记录的 RR 字段（写入根域 zone）。
+//   subdomain=="@" → "smtp"       （结果 smtp.根域 → IP）
+//   subdomain=="mail1" → "smtp.mail1"（结果 smtp.mail1.根域 → IP）
+// v0.2.27：子域模式下漏建 smtp.子域.根域 A 记录的修复。
+func SMTPEntryRR(subdomain string) string {
+	if subdomain == "" || subdomain == "@" {
+		return "smtp"
+	}
+	return "smtp." + subdomain
+}
+
 func SubdomainFromFQDN(fqdn, rootDomain string) string {
 	fqdn = strings.TrimSpace(strings.TrimSuffix(fqdn, "."))
 	rootDomain = strings.TrimSpace(strings.TrimSuffix(rootDomain, "."))
