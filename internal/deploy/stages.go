@@ -1170,12 +1170,12 @@ func BatchSetPTR(ctx context.Context, vpsIDs []string, onLog LogCallback) error 
 				return
 			default:
 			}
-			var gcpCredID, zone, instanceName, ip, fqdn, additionalIPsJSON, rootDomain string
+			var gcpCredID, zone, instanceName, ip, fqdn, additionalIPsJSON, rootDomain, aliyunCredID string
 			var nicCount int
 			row := db.QueryRowContext(ctx,
-				`SELECT gcp_cred_id, zone, name, ip, fqdn, COALESCE(nic_count,1), COALESCE(additional_ips_json,''), COALESCE(domain,'')
+				`SELECT gcp_cred_id, zone, name, ip, fqdn, COALESCE(nic_count,1), COALESCE(additional_ips_json,''), COALESCE(domain,''), COALESCE(aliyun_cred_id,'')
 				   FROM vps_instances WHERE id=?`, id)
-			if err := row.Scan(&gcpCredID, &zone, &instanceName, &ip, &fqdn, &nicCount, &additionalIPsJSON, &rootDomain); err != nil {
+			if err := row.Scan(&gcpCredID, &zone, &instanceName, &ip, &fqdn, &nicCount, &additionalIPsJSON, &rootDomain, &aliyunCredID); err != nil {
 				log("ERROR", "读取 VPS 失败: %v", err)
 				return
 			}
@@ -1197,6 +1197,24 @@ func BatchSetPTR(ctx context.Context, vpsIDs []string, onLog LogCallback) error 
 				return
 			}
 			_, _ = db.Exec(`UPDATE vps_instances SET ptr_status='pending' WHERE id=?`, id)
+
+			// v0.2.28：StartMTADeploy（"批量设 PTR"按钮）也补建 smtp.子域 A 记录。
+			// 之前 v0.2.27 只在 autoSetPTRForSupportedNICs 那条路径里加（Stage C 部署链路），
+			// 漏了这条独立的 Stage D 路径，导致用户 30 台 VPS 已部署完后重跑"批量设 PTR"
+			// 不补 smtp.子域 A —— 阿里云仍只有一条 smtp 解析。
+			if rootDomain != "" && aliyunCredID != "" {
+				if aliDNS, aerr := loadAliyunDns(aliyunCredID); aerr == nil {
+					subdomain := SubdomainFromFQDN(fqdn, rootDomain)
+					smtpRR := SMTPEntryRR(subdomain)
+					smtpSpec := dns.DnsRecordSpec{RR: smtpRR, RecordType: "A", Value: ip}
+					if err := upsertAliyunRecordAndSyncLocal(ctx, db, aliDNS, aliyunCredID, rootDomain, id, smtpSpec, log); err != nil {
+						log("WARN", "补建 %s.%s A 失败: %v", smtpRR, rootDomain, err)
+					} else {
+						log("INFO", "✅ SMTP 入口 A 已确保: %s.%s → %s", smtpRR, rootDomain, ip)
+					}
+				}
+			}
+
 			// v0.1.74：批量重设 PTR 也走"所有 NIC 都试一遍"路径
 			log("INFO", "设置 PTR nic0: %s -> %s", ip, fqdn)
 			if err := cli.SetInstancePTRForNIC(ctx, zone, instanceName, 0, ip, fqdn); err != nil {

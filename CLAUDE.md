@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-05-30
-> 当前版本：**v0.2.27**（`version.txt`；修 smtp.子域 A 漏建 + Stage 4 顺带补建供老部署修补）
+> 当前版本：**v0.2.28**（`version.txt`；StartMTADeploy "批量设 PTR" 路径也补 smtp.子域 A）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.27** | 最新。**修 smtp.子域 A 漏建**：v0.2.25 启用子域模式（mail1./mail2./...）后用户报阿里云只有 mail1/mail2 A 记录、没有对应 smtp.mail1/smtp.mail2 A 记录。根因 stages.go 三处 DNS 配置硬编码 `RR: "smtp"`（v0.2.6 写死）。新增 helpers.go `SMTPEntryRR(subdomain)` 辅助：@→"smtp"，mail1→"smtp.mail1"；KumoMTA/Postfix/mailcow 三个 deploy 函数的 records 列表全部用 helper。**补救老部署**：autoSetPTRForSupportedNICs 在 ensureDomainVerified 后顺带 UpsertRecord smtp.子域 A（幂等），用户重跑 Stage 4 批量 RDNS 即可补全已部署的 30 台 |
+| **v0.2.28** | 最新。**修 v0.2.27 补建逻辑加错地方**：v0.2.27 把 smtp.子域 A 补建加在 `autoSetPTRForSupportedNICs`（Stage C 部署链路），但用户用「批量设 PTR」按钮走的是独立的 `StartMTADeploy` 路径（stages.go:1158-1228 的 goroutine worker），完全绕开 autoSetPTRForSupportedNICs，所以补建逻辑根本没执行——用户日志里看不到 "✅ SMTP 入口 A 已确保" 字样，阿里云仍只有 1 条 smtp 解析。本版在 StartMTADeploy 的 SELECT 中加 aliyun_cred_id，PTR 设置前调 upsertAliyunRecordAndSyncLocal 补 smtp.{subdomain} A 记录。UpsertRecord 幂等不会撞已有记录 |
+| v0.2.27 | **修 smtp.子域 A 漏建**：v0.2.25 启用子域模式（mail1./mail2./...）后用户报阿里云只有 mail1/mail2 A 记录、没有对应 smtp.mail1/smtp.mail2 A 记录。根因 stages.go 三处 DNS 配置硬编码 `RR: "smtp"`（v0.2.6 写死）。新增 helpers.go `SMTPEntryRR(subdomain)` 辅助：@→"smtp"，mail1→"smtp.mail1"；KumoMTA/Postfix/mailcow 三个 deploy 函数的 records 列表全部用 helper。**补救老部署**：autoSetPTRForSupportedNICs 在 ensureDomainVerified 后顺带 UpsertRecord smtp.子域 A（幂等），用户重跑 Stage 4 批量 RDNS 即可补全已部署的 30 台 |
 | v0.2.26 | **vpsPerDomain 默认自动填满**：v0.2.25 加了"每域 VPS 数"输入但默认 1，用户输 1 个根域时不会自动展开 N 子域，需手动改。本版加 `autoFillVpsPerDomain` 在 textarea onChange 时算 `ceil(readyVPS/根域数)` 自动填；用户主动改 input 后置 `vpsPerDomainTouched=true` 停止自动填。30 VPS / 1 域 → 自动 30；30 VPS / 10 域 → 自动 3 |
 | v0.2.25 | **Stage C 多 VPS 共享根域**：用户场景 30 台 VPS 但只有 10 个域名，需自动分配 mail1./mail2./mail3. 子域。前端 Batch.tsx Stage C 弹窗加"每域 VPS 数"输入（默认 1）+"子域命名模式"输入（默认 `mail{N}`，`{N}`=1..N）；buildDomainIPMap 按 roots × per 展开 FQDN list（如 mail1.a.com / mail2.a.com / mail3.a.com / mail1.b.com / ...）配对 VPS IP。后端 StageCRequest 加 `RootDomainMap map[string]string`（FQDN→根域），Stage C 主循环用 `SubdomainFromFQDN(fqdn, rootDomain)` 反推子域；落库 `domain=rootDomain, fqdn=完整FQDN`；A 记录 `RR=subdomain` 而非硬编码 `@`；DKIM/SPF/MX/DMARC 由 `DNSRRsForSubdomain` 自动适配子域（早就支持）。空 RootDomainMap 时退化为 fqdn==rootDomain，完全兼容老版本逐域逐 VPS |
 | v0.2.24 | **亚洲多区域并发筛 IP**：用户需求"日本+韩国+新加坡+台湾一键都筛"。后端 stages.go region 白名单扩到 7 个（asia-northeast1/2/3 + asia-east1/2 + asia-southeast1/2）；**worker 改固定绑定 region**（按 workerID 分配），不再 v0.2.14 那种 attempt 轮询——这样每个 region 池被独立 worker 持续撑满各自 175 配额，hold 翻新机制单池生效；concurrency 自动 ≥ len(regions)×2 保证每区至少 2 worker，硬上限 20；claimSlot 仍全局抢（哪区先有干净 IP 先填）。前端 Batch.tsx Step 1 改 checkbox 多选（默认勾首尔），每项显示池前缀特征 + 国旗 emoji。req.Regions 字段已存在（v0.2.14 用过被回退）现复用 |
