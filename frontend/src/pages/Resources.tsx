@@ -5,6 +5,8 @@ import {
   // @ts-ignore - bindings 会在 wails build 时重新生成
   BatchSetPTR,
   // @ts-ignore
+  RepairBatchPTR,
+  // @ts-ignore
   StartMTADeploy,
   // @ts-ignore
   ListPersonas,
@@ -130,6 +132,20 @@ export default function Resources() {
     } catch (e: any) { toast('error', 'PTR 失败: ' + (e?.message || e)) }
   }
 
+  // v0.2.31：一键修复——扫所有 VPS 对比 GCP 当前 IP，不一致的强绑回静态 IP
+  const repairPTR = async () => {
+    const targets = selected.size > 0 ? Array.from(selected) : displayedVpsList.map((v: any) => v.id)
+    if (targets.length === 0) { toast('warning', '没有 VPS 可修复'); return }
+    if (!await confirmDlg({
+      message: `扫描 ${targets.length} 台 VPS，对比 GCP 当前 IP 与数据库静态 IP，不一致的自动重绑回静态 IP（低并发 5）。\n\n常用于：批量设 PTR 后部分 VPS 连不上、阿里云 DNS 指向旧静态 IP 但 GCP 已分配了 ephemeral IP。`,
+      danger: false,
+    })) return
+    try {
+      const taskID = await RepairBatchPTR(targets)
+      toast('success', `已提交 ${targets.length} 台 VPS 的修复任务${taskID ? `：${taskID}` : ''}（查看「批量任务」页面日志）`)
+    } catch (e: any) { toast('error', '修复失败: ' + (e?.message || e)) }
+  }
+
   const fixTag = async () => {
     if (selected.size === 0) { toast('warning', '请先勾选 VPS'); return }
     try {
@@ -219,6 +235,11 @@ export default function Resources() {
               <button onClick={batchPTR} disabled={selected.size === 0}
                       className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
                 <Globe size={14} /> 批量设 PTR ({selected.size})
+              </button>
+              <button onClick={repairPTR}
+                      title="扫所有 VPS 对比 GCP 当前 IP vs 数据库静态 IP，不一致的自动重绑回静态 IP。不勾选=扫全部，勾选=只扫勾选的"
+                      className="bg-rose-600 hover:bg-rose-500 text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">
+                🚑 一键修复 PTR ({selected.size > 0 ? selected.size : '全部'})
               </button>
               <button onClick={openDeployModal} disabled={selected.size === 0}
                       className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">

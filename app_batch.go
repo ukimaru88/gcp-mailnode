@@ -121,6 +121,16 @@ func (a *App) BatchSetPTR(vpsIDs []string) (string, error) {
 	return deploy.StartBatchSetPTRTask(ctx, vpsIDs, onLog)
 }
 
+// RepairBatchPTR v0.2.31：一键修复——扫所有 VPS 对比 GCP 当前 IP，不一致的强绑回静态 IP
+func (a *App) RepairBatchPTR(vpsIDs []string) (string, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	onLog := makeStageLogger(a, "stage-c:log")
+	return deploy.StartRepairBatchPTRTask(ctx, vpsIDs, onLog)
+}
+
 // StartMTADeploy 阶段 D：对选中 VPS 装 KumoMTA
 func (a *App) StartMTADeploy(vpsIDs []string, opts deploy.DeployOpts) (string, error) {
 	ctx := a.ctx

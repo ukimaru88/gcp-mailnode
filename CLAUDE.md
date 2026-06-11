@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
-> 最后更新：2026-05-30
-> 当前版本：**v0.2.30**（`version.txt`；per=1 时直接用根域，修硬编码文案）
+> 最后更新：2026-06-11
+> 当前版本：**v0.2.31**（`version.txt`；BatchSetPTR sem=5 限流 + 一键修复 PTR）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.30** | 最新。**v0.2.25 buildDomainIPMap 行为修正**：用户报"每域 VPS 数=1 但 UI 仍生成 mail1.xxx.com"。根因 buildDomainIPMap 条件 `per === 1 && pattern === '@'` 错误——pattern 默认 `mail{N}` 不等于 `@`，所以 per=1 也会走 pattern 展开路径，生成 mail1.根域 而非用户预期的根域本身。改为 `if (per === 1) fqdn = root`（永远直接用根域，不读 pattern），跟 v0.2.24 行为完全一致。同时修文案"10 个根域 × 3 = 30 个 FQDN"硬编码值为动态 `nRoots × per` |
+| **v0.2.31** | 最新。**两项修复 + 一键修复功能**：① **BatchSetPTR 加 sem 限 5 并发**：之前 30 台无限并发跑 delete+add AccessConfig，GCP API 报 DONE 但实际静态 IP 没绑回去 → VM 拿到 ephemeral IP → 阿里云 DNS 仍指向静态 IP → 12/30 台连不上。stages.go:1158 仿 StartMTADeploy 加 `sem := make(chan struct{}, 5)` 限并发。② **新增 RepairBatchPTR 函数 + 一键修复 PTR 按钮**：扫所有 VPS（或勾选的）→ GetInstance 拿当前 external IP → 跟 DB.ip 对比 → 不一致的低并发（sem=5）SetInstancePTRForNIC 强绑回静态 IP → 报告"正常 X / 修复 Y / 失败 Z / 跳过 W"。Resources.tsx 加红色 🚑 按钮（不勾选=扫全部）。前后端编译 0 错 + 已打包 |
+| v0.2.30 | **v0.2.25 buildDomainIPMap 行为修正**：用户报"每域 VPS 数=1 但 UI 仍生成 mail1.xxx.com"。根因 buildDomainIPMap 条件 `per === 1 && pattern === '@'` 错误——pattern 默认 `mail{N}` 不等于 `@`，所以 per=1 也会走 pattern 展开路径，生成 mail1.根域 而非用户预期的根域本身。改为 `if (per === 1) fqdn = root`（永远直接用根域，不读 pattern），跟 v0.2.24 行为完全一致。同时修文案"10 个根域 × 3 = 30 个 FQDN"硬编码值为动态 `nRoots × per` |
 | v0.2.29 | **两项修复**：① **Stage A 误报 0/N**：用户报 v0.2.24 实测 Stage A 真的筛到 20 个 IP（Stage B 也成功开机 20 台），但收尾日志却说"筛到 0/20"。根因 Stage A 主流程 `wg.Wait() → Drain (28 秒) → 收尾统计`，但 Drain 期间用户已点击 Stage B，StartStageB 共享同一 batchState 并 `atomic.StoreInt64(&state.succeeded, 0)` 重置；Stage A 后续 atomic.Load 读到 0。修复：把 got/used 在 wg.Wait 之后**立即固化到局部变量**，后续日志全用局部值。② **关 v0.2.26 自动填满**：用户反馈"自动子域名不好用"——自动 ceil(VPS/根域) 干扰用户预期。回到手动模式，vpsPerDomain 默认 1，用户主动改才展开 mail1/mail2/...（v0.2.25 功能保留，只是默认不触发） |
 | v0.2.28 | **修 v0.2.27 补建逻辑加错地方**：v0.2.27 把 smtp.子域 A 补建加在 `autoSetPTRForSupportedNICs`（Stage C 部署链路），但用户用「批量设 PTR」按钮走的是独立的 `StartMTADeploy` 路径（stages.go:1158-1228 的 goroutine worker），完全绕开 autoSetPTRForSupportedNICs，所以补建逻辑根本没执行——用户日志里看不到 "✅ SMTP 入口 A 已确保" 字样，阿里云仍只有 1 条 smtp 解析。本版在 StartMTADeploy 的 SELECT 中加 aliyun_cred_id，PTR 设置前调 upsertAliyunRecordAndSyncLocal 补 smtp.{subdomain} A 记录。UpsertRecord 幂等不会撞已有记录 |
 | v0.2.27 | **修 smtp.子域 A 漏建**：v0.2.25 启用子域模式（mail1./mail2./...）后用户报阿里云只有 mail1/mail2 A 记录、没有对应 smtp.mail1/smtp.mail2 A 记录。根因 stages.go 三处 DNS 配置硬编码 `RR: "smtp"`（v0.2.6 写死）。新增 helpers.go `SMTPEntryRR(subdomain)` 辅助：@→"smtp"，mail1→"smtp.mail1"；KumoMTA/Postfix/mailcow 三个 deploy 函数的 records 列表全部用 helper。**补救老部署**：autoSetPTRForSupportedNICs 在 ensureDomainVerified 后顺带 UpsertRecord smtp.子域 A（幂等），用户重跑 Stage 4 批量 RDNS 即可补全已部署的 30 台 |

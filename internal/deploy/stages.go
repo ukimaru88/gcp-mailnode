@@ -1155,14 +1155,23 @@ func BatchSetPTR(ctx context.Context, vpsIDs []string, onLog LogCallback) error 
 		}
 	}()
 
-	// 并发执行：每台独立 goroutine，6 台同时跑不串行等
+	// v0.2.31：限并发 5。之前 30 台无限并发跑 delete+add AccessConfig，
+	// GCP API 报 DONE 但实际静态 IP 没绑回去 → VM 拿到 ephemeral IP → 阿里云
+	// DNS 仍指向静态 IP → 12/30 台连不上。降并发后 race 消失。
+	concurrency := len(vpsIDs)
+	if concurrency > 5 {
+		concurrency = 5
+	}
+	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i, vpsID := range vpsIDs {
 		slot := i + 1
 		id := vpsID
 		wg.Add(1)
+		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
 					onLog("ptr", slot, "ERROR", fmt.Sprintf("PTR panic: %v", r))
@@ -1250,6 +1259,137 @@ func BatchSetPTR(ctx context.Context, vpsIDs []string, onLog LogCallback) error 
 	}
 	wg.Wait()
 	return nil
+}
+
+// RepairBatchPTR v0.2.31：一键修复 PTR。扫所有 vpsIDs，对比 GCP 当前 external IP
+// 与 DB.ip：① 一致 → 跳过 ② 不一致 → 说明上次 BatchSetPTR race 后没绑回静态 IP，
+// 调 SetInstancePTRForNIC（用 DB 里的 IP）强绑回去。低并发 sem=5 防 race。
+func RepairBatchPTR(ctx context.Context, vpsIDs []string, onLog LogCallback) error {
+	if len(vpsIDs) == 0 {
+		return fmt.Errorf("至少选择一个 VPS")
+	}
+	if onLog == nil {
+		onLog = func(string, int, string, string) {}
+	}
+	db := store.DB()
+	if db == nil {
+		return fmt.Errorf("数据库未就绪")
+	}
+	gcpClients := map[string]*gcp.Client{}
+	var cliMu sync.Mutex
+	getCli := func(credID string) (*gcp.Client, error) {
+		cliMu.Lock()
+		defer cliMu.Unlock()
+		if c, ok := gcpClients[credID]; ok {
+			return c, nil
+		}
+		c, err := loadGCPClient(ctx, credID)
+		if err != nil {
+			return nil, err
+		}
+		gcpClients[credID] = c
+		return c, nil
+	}
+	defer func() {
+		for _, cli := range gcpClients {
+			_ = cli.Close()
+		}
+	}()
+
+	concurrency := len(vpsIDs)
+	if concurrency > 5 {
+		concurrency = 5
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var okCount, fixedCount, failCount, skipCount int64
+	for i, vpsID := range vpsIDs {
+		slot := i + 1
+		id := vpsID
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					onLog("repair", slot, "ERROR", fmt.Sprintf("修复 panic: %v", r))
+				}
+			}()
+			log := func(level, format string, args ...interface{}) {
+				onLog("repair", slot, level, fmt.Sprintf(format, args...))
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			var gcpCredID, zone, instanceName, expectedIP, fqdn string
+			row := db.QueryRowContext(ctx,
+				`SELECT gcp_cred_id, zone, name, ip, fqdn FROM vps_instances WHERE id=?`, id)
+			if err := row.Scan(&gcpCredID, &zone, &instanceName, &expectedIP, &fqdn); err != nil {
+				log("ERROR", "读取 VPS 失败: %v", err)
+				atomic.AddInt64(&failCount, 1)
+				return
+			}
+			if expectedIP == "" || fqdn == "" {
+				log("WARN", "%s 缺少 ip/fqdn，跳过", instanceName)
+				atomic.AddInt64(&skipCount, 1)
+				return
+			}
+			cli, err := getCli(gcpCredID)
+			if err != nil {
+				log("ERROR", "加载 GCP 客户端失败: %v", err)
+				atomic.AddInt64(&failCount, 1)
+				return
+			}
+			info, err := cli.GetInstance(ctx, zone, instanceName)
+			if err != nil {
+				log("ERROR", "GetInstance %s 失败: %v", instanceName, err)
+				atomic.AddInt64(&failCount, 1)
+				return
+			}
+			actualIP := info.ExternalIP
+			if actualIP == expectedIP {
+				log("INFO", "✓ %s IP 正常: %s（无需修复）", fqdn, expectedIP)
+				atomic.AddInt64(&okCount, 1)
+				return
+			}
+			log("WARN", "⚠ %s IP 不匹配: 实际=%s 期望=%s，开始修复", fqdn, actualIP, expectedIP)
+			if err := cli.SetInstancePTRForNIC(ctx, zone, instanceName, 0, expectedIP, fqdn); err != nil {
+				log("ERROR", "修复 %s 失败: %v", fqdn, err)
+				_, _ = db.Exec(`UPDATE vps_instances SET ptr_status='failed', deploy_error=? WHERE id=?`, err.Error(), id)
+				atomic.AddInt64(&failCount, 1)
+				return
+			}
+			_, _ = db.Exec(`UPDATE vps_instances SET ptr_status='set', deploy_status='ptr_ready', deploy_error='' WHERE id=?`, id)
+			log("INFO", "✅ %s 修复成功: %s → %s", fqdn, actualIP, expectedIP)
+			atomic.AddInt64(&fixedCount, 1)
+		}()
+	}
+	wg.Wait()
+	onLog("repair", 0, "INFO", fmt.Sprintf("====== 一键修复完成：正常 %d / 修复 %d / 失败 %d / 跳过 %d ======",
+		atomic.LoadInt64(&okCount), atomic.LoadInt64(&fixedCount), atomic.LoadInt64(&failCount), atomic.LoadInt64(&skipCount)))
+	return nil
+}
+
+func StartRepairBatchPTRTask(ctx context.Context, vpsIDs []string, onLog LogCallback) (string, error) {
+	if len(vpsIDs) == 0 {
+		return "", fmt.Errorf("至少选择一个 VPS")
+	}
+	if onLog == nil {
+		onLog = func(string, int, string, string) {}
+	}
+	db := store.DB()
+	if db == nil {
+		return "", fmt.Errorf("数据库未就绪")
+	}
+	reqJSON, _ := json.Marshal(map[string]interface{}{"vps_ids": vpsIDs})
+	return startCancelableStageTask(ctx, db, "ptr-running", len(vpsIDs), string(reqJSON), func(runCtx context.Context, taskID string) error {
+		return RepairBatchPTR(runCtx, vpsIDs, func(_ string, slot int, level, msg string) {
+			onLog(taskID, slot, level, msg)
+		})
+	})
 }
 
 func StartBatchSetPTRTask(ctx context.Context, vpsIDs []string, onLog LogCallback) (string, error) {

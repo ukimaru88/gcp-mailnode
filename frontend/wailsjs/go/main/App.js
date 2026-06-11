@@ -186,6 +186,10 @@ export function RemoveBlackSegment(arg1) {
   return window['go']['main']['App']['RemoveBlackSegment'](arg1);
 }
 
+export function RepairBatchPTR(arg1) {
+  return window['go']['main']['App']['RepairBatchPTR'](arg1);
+}
+
 export function SavePersona(arg1) {
   return window['go']['main']['App']['SavePersona'](arg1);
 }

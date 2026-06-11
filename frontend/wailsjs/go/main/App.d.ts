@@ -95,6 +95,8 @@ export function PruneBatchIPs(arg1:string,arg2:Array<string>):Promise<number>;
 
 export function RemoveBlackSegment(arg1:number):Promise<void>;
 
+export function RepairBatchPTR(arg1:Array<string>):Promise<string>;
+
 export function SavePersona(arg1:main.PersonaDTO):Promise<string>;
 
 export function SaveVPSTemplate(arg1:main.VPSTemplateDTO):Promise<string>;
