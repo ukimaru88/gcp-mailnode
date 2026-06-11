@@ -446,8 +446,11 @@ export default function Batch() {
     for (const root of roots) {
       for (let i = 1; i <= per; i++) {
         let fqdn: string
-        if (per === 1 && subdomainPattern.trim() === '@') {
-          fqdn = root // 旧行为：单 VPS 用根域
+        // v0.2.30：per === 1 时永远直接用根域名，不读 pattern。修 v0.2.25 的 bug：
+        // 之前 per=1 + pattern="mail{N}" 会展开成 mail1.根域 而非用户预期的根域；
+        // 现在只有 per > 1 才走 pattern 展开路径，跟 v0.2.24 行为完全一致。
+        if (per === 1) {
+          fqdn = root
         } else {
           const sub = subdomainPattern.replace(/\{N\}/g, String(i)).trim()
           fqdn = sub === '' || sub === '@' ? root : `${sub}.${root}`
@@ -1060,7 +1063,11 @@ export default function Batch() {
                        value={vpsPerDomain}
                        onChange={e => { setVpsPerDomain(Math.max(1, Math.min(50, Number(e.target.value) || 1))); setVpsPerDomainTouched(true) }} />
                 <div className="text-[10px] text-slate-500 mt-0.5">
-                  10 个根域 × 3 = 30 个 FQDN
+                  {(() => {
+                    const nRoots = parseDomains(domainIPText).length
+                    const per = Math.max(1, vpsPerDomain)
+                    return `${nRoots} 个根域 × ${per} = ${nRoots * per} 个 FQDN`
+                  })()}
                 </div>
               </div>
               <div>
