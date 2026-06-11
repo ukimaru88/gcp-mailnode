@@ -354,6 +354,14 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 		}
 		wg.Wait()
 
+		// v0.2.29：**统计必须在 Drain 之前抓取**。Drain 释放 hold 池可能耗时 30+ 秒
+		// （用户实测 425 个脏 IP 释放 28 秒），期间用户可能已点击 Stage B；StartStageB
+		// 共享同一个 state 实例并 atomic.StoreInt64(&state.succeeded, 0) 重置计数，
+		// 导致 Stage A 收尾 atomic.LoadInt64 读到 0 → 误报 "筛到 0/N"。
+		// 把 got/used 在 worker wg.Wait() 之后立即固化到局部变量，后续日志全用它。
+		got := int(atomic.LoadInt64(&state.succeeded))
+		used := int(atomic.LoadInt64(&totalAttempts))
+
 		// v0.1.58：清扫剩余 hold 中的脏 IP（不足 holdThreshold 的尾巴）
 		dirty.Drain(runCtx, db, func(level, format string, args ...interface{}) {
 			onLog(batchID, 0, level, fmt.Sprintf(format, args...))
@@ -368,9 +376,7 @@ func StartStageA(ctx context.Context, req StageARequest, onLog LogCallback) (str
 			onLog(batchID, 0, "INFO", fmt.Sprintf("post-grouping: %d 组 × %d NIC = %d clean IP 已分配", groups, req.NICCount, groups*req.NICCount))
 		}
 
-		// 收尾统计
-		got := int(atomic.LoadInt64(&state.succeeded))
-		used := int(atomic.LoadInt64(&totalAttempts))
+		// 收尾统计（用 wg.Wait 后立即固化的 got/used，不被 Stage B 启动覆盖）
 		if got < req.Count {
 			atomic.StoreInt64(&state.failed, int64(req.Count-got))
 			if maxTotalAttempts > 0 && int64(used) >= maxTotalAttempts {

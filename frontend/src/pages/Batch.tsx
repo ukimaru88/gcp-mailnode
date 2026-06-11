@@ -171,22 +171,15 @@ export default function Batch() {
   const [domainIPText, setDomainIPText] = useState('')
   // v0.2.25：每个根域分几台 VPS（用户场景 30 台 / 10 域 = 3）
   const [vpsPerDomain, setVpsPerDomain] = useState<number>(1)
-  // v0.2.26：用户手动改过 vpsPerDomain 后停止自动填（避免覆盖用户意图）
+  // v0.2.29：v0.2.26 的"自动填满"被用户反馈不好用——干扰预期、易误展开。回到手动模式：
+  // vpsPerDomain 默认 1（每个根域一个 VPS），用户想要 mail1/2/3 时主动改输入框。
+  // 保留 touched 字段以兼容 setter 调用点，但不再触发自动填充。
   const [vpsPerDomainTouched, setVpsPerDomainTouched] = useState(false)
   // 子域命名模式：{N} 占位会被 1..vpsPerDomain 替换。@/空 = 直接用根域（仅 vpsPerDomain=1 时）
   const [subdomainPattern, setSubdomainPattern] = useState<string>('mail{N}')
 
-  // v0.2.26：自动算 vpsPerDomain = ceil(readyVPS / 根域数)，让用户输入根域后软件自动
-  // 把 N 台 VPS 平均分到所有根域。用户主动改过 input 则停止自动填。
-  const autoFillVpsPerDomain = (text: string) => {
-    if (vpsPerDomainTouched) return
-    const roots = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('#') && l.includes('.') && !l.startsWith('.') && !l.endsWith('.'))
-    const vpsCount = batchVPS.filter(v => v.ip && v.deploy_status === 'vps_running').length
-    if (roots.length > 0 && vpsCount > 0) {
-      const auto = Math.max(1, Math.ceil(vpsCount / roots.length))
-      setVpsPerDomain(auto)
-    }
-  }
+  // v0.2.29：no-op，保持原签名不破坏 textarea onChange 调用点。
+  const autoFillVpsPerDomain = (_text: string) => { /* disabled */ }
   const [aliID, setAliID] = useState('')
 
   const appendLog = (setter: React.Dispatch<React.SetStateAction<LogLine[]>>) => (data: any) => {
