@@ -174,8 +174,16 @@ type Zone struct {
 // 选择标准：公共免费可查询，无需 API key；活跃在维护；mxtoolbox 默认会查。
 // 故意排除的：Abusix/Invaluement（需付费订阅）、已停服的 Mailspike/Truncate 等。
 var DefaultZones = []Zone{
-	// Spamhaus 系（ZEN 已聚合 SBL+XBL+PBL+CSS+DROP）
-	{Name: "Spamhaus ZEN", Host: "zen.spamhaus.org"},
+	// Spamhaus 系（v0.2.32 拆开查，跳过 PBL）
+	// 之前用 zen.spamhaus.org 聚合查，但 ZEN 含 PBL（Policy Block List），
+	// PBL 把所有云 IP 段一刀切列入（"政策上不该直接发邮件"），导致 GCP/AWS/Azure
+	// 几乎所有静态 IP 都命中 ZEN 一次，被算 HitCount=1。实测 136.110.56.58 在
+	// SBL/XBL/CSS/Barracuda/SpamCop 全 NXDOMAIN，只 PBL 命中 127.0.0.11。
+	// Gmail/Outlook/Yahoo 等大邮箱不查 PBL，所以 PBL 命中对实际投递无影响。
+	// 拆开 SBL（精准 spam）+ XBL（病毒/僵尸网络）+ DROP（高危段）+ CSS（单查保留），跳过 PBL。
+	{Name: "Spamhaus SBL", Host: "sbl.spamhaus.org"},
+	{Name: "Spamhaus XBL", Host: "xbl.spamhaus.org"},
+	{Name: "Spamhaus DROP", Host: "drop.spamhaus.org"},
 	// Barracuda
 	{Name: "Barracuda", Host: "b.barracudacentral.org"},
 	// SpamCop
@@ -191,7 +199,7 @@ var DefaultZones = []Zone{
 	{Name: "UCEPROTECT-L3", Host: "dnsbl-3.uceprotect.net"},
 	// Passive Spam Block List
 	{Name: "PSBL", Host: "psbl.surriel.com"},
-	// Spamhaus CSS（单独查一次，虽然 ZEN 含了，额外印证）
+	// Spamhaus CSS（精准 spammer，独立查）
 	{Name: "Spamhaus CSS", Host: "css.spamhaus.org"},
 	// Swinog
 	{Name: "Swinog URIBL", Host: "uribl.swinog.ch"},
