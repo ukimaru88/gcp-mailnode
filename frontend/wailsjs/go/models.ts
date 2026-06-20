@@ -744,6 +744,28 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class SmtpReplySample {
+	    time: string;
+	    domain: string;
+	    recipient: string;
+	    kind: string;
+	    code: number;
+	    content: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SmtpReplySample(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.time = source["time"];
+	        this.domain = source["domain"];
+	        this.recipient = source["recipient"];
+	        this.kind = source["kind"];
+	        this.code = source["code"];
+	        this.content = source["content"];
+	    }
+	}
 	export class ServerStatusDTO {
 	    vps_id: string;
 	    name: string;
@@ -773,6 +795,10 @@ export namespace main {
 	    unique_domains: number;
 	    top_domains: ServerCounterDTO[];
 	    bounce_reasons: ServerReasonDTO[];
+	    deferred_reasons: ServerReasonDTO[];
+	    recent_smtp_replies: SmtpReplySample[];
+	    queue_summary: string;
+	    top_queue_domains: ServerCounterDTO[];
 	    recent_errors: string[];
 	    recommendations: string[];
 	    raw_status: Record<string, string>;
@@ -811,6 +837,10 @@ export namespace main {
 	        this.unique_domains = source["unique_domains"];
 	        this.top_domains = this.convertValues(source["top_domains"], ServerCounterDTO);
 	        this.bounce_reasons = this.convertValues(source["bounce_reasons"], ServerReasonDTO);
+	        this.deferred_reasons = this.convertValues(source["deferred_reasons"], ServerReasonDTO);
+	        this.recent_smtp_replies = this.convertValues(source["recent_smtp_replies"], SmtpReplySample);
+	        this.queue_summary = source["queue_summary"];
+	        this.top_queue_domains = this.convertValues(source["top_queue_domains"], ServerCounterDTO);
 	        this.recent_errors = source["recent_errors"];
 	        this.recommendations = source["recommendations"];
 	        this.raw_status = source["raw_status"];
@@ -834,6 +864,7 @@ export namespace main {
 		    return a;
 		}
 	}
+	
 	export class StaticIPDTO {
 	    id: string;
 	    gcp_cred_id: string;

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -44,9 +45,24 @@ type ServerStatusDTO struct {
 	UniqueDomains   int                `json:"unique_domains"`
 	TopDomains      []ServerCounterDTO `json:"top_domains"`
 	BounceReasons   []ServerReasonDTO  `json:"bounce_reasons"`
+	// v0.2.33：深度诊断字段
+	DeferredReasons  []ServerReasonDTO  `json:"deferred_reasons"`           // 临时失败 (4xx) 原因分类
+	RecentSmtpReplies []SmtpReplySample `json:"recent_smtp_replies"`        // 最近真实 SMTP 响应原话样本
+	QueueSummary     string             `json:"queue_summary"`              // kcli queue-summary 输出原文
+	TopQueueDomains  []ServerCounterDTO `json:"top_queue_domains"`          // 队列堵塞 Top 域名（解析 queue-summary）
 	RecentErrors    []string           `json:"recent_errors"`
 	Recommendations []string           `json:"recommendations"`
 	RawStatus       map[string]string  `json:"raw_status"`
+}
+
+// SmtpReplySample 最近一条 SMTP 真实响应样本（对方服务器返回的原话）
+type SmtpReplySample struct {
+	Time      string `json:"time"`       // 时间
+	Domain    string `json:"domain"`     // 收件域名
+	Recipient string `json:"recipient"`  // 收件人（部分脱敏）
+	Kind      string `json:"kind"`       // "Bounce" / "Deferred"
+	Code      int    `json:"code"`       // SMTP 状态码
+	Content   string `json:"content"`    // 对方服务器响应原文（截断）
 }
 
 type ServerCounterDTO struct {
@@ -65,6 +81,7 @@ type kumoStatusEvent struct {
 	Type      string `json:"type"`
 	Recipient string `json:"recipient"`
 	Queue     string `json:"queue"`
+	Timestamp int64  `json:"timestamp"`
 	Response  struct {
 		Code    int    `json:"code"`
 		Content string `json:"content"`
@@ -138,6 +155,19 @@ printf 'queue_bytes=%s\n' "$(du -sb /var/spool/kumomta 2>/dev/null | awk '{print
 printf 'meta_files=%s\n' "$(find /var/spool/kumomta/meta -type f 2>/dev/null | wc -l)"
 printf 'data_files=%s\n' "$(find /var/spool/kumomta/data -type f 2>/dev/null | wc -l)"
 printf 'recent_journal=%s\n' "$(journalctl -u kumomta --since '1 hour ago' -p warning --no-pager -n 20 2>/dev/null | tr '\n' '|' | sed 's/=/ /g')"
+
+# v0.2.33：kcli queue-summary —— 看哪些队列堵塞最多
+KCLI=""
+for p in /opt/kumomta/sbin/kcli /opt/kumomta/bin/kcli /usr/bin/kcli /usr/local/bin/kcli $(command -v kcli 2>/dev/null); do
+  if [ -x "$p" ]; then KCLI="$p"; break; fi
+done
+if [ -n "$KCLI" ]; then
+  qs=$("$KCLI" queue-summary 2>&1 | head -100)
+  # 用 base64 避免特殊字符破坏 kv 解析
+  printf 'queue_summary_b64=%s\n' "$(printf '%%s' "$qs" | base64 -w0 2>/dev/null)"
+else
+  printf 'queue_summary_b64=%s\n' "$(printf 'kcli not found in PATH or /opt/kumomta/{sbin,bin}/' | base64 -w0)"
+fi
 `
 }
 
@@ -232,6 +262,58 @@ func applyStatusFields(res *ServerStatusDTO) {
 			}
 		}
 	}
+	// v0.2.33：kcli queue-summary 解 base64
+	if b64 := strings.TrimSpace(m["queue_summary_b64"]); b64 != "" {
+		if decoded, err := base64Decode(b64); err == nil {
+			res.QueueSummary = strings.TrimSpace(decoded)
+			res.TopQueueDomains = parseQueueSummaryTop(decoded, 12)
+		} else {
+			res.QueueSummary = "(解析 queue-summary 失败: " + err.Error() + ")"
+		}
+	}
+}
+
+func base64Decode(s string) (string, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// parseQueueSummaryTop 解析 kcli queue-summary 输出，提取队列长度 Top N 域名。
+// kcli queue-summary 输出格式（示例，可能因版本不同）：
+//
+//	ScheduledQueue                    Count    NextDue
+//	plala.or.jp                       5234     ...
+//	ocn.ne.jp                         3120     ...
+func parseQueueSummaryTop(out string, limit int) []ServerCounterDTO {
+	counts := map[string]int{}
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "Scheduled") ||
+			strings.HasPrefix(line, "Ready") || strings.HasPrefix(line, "Source") ||
+			strings.HasPrefix(line, "Site") || strings.HasPrefix(line, "MX") ||
+			strings.HasPrefix(line, "===") || strings.HasPrefix(line, "---") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		// 找一列纯数字作为 count
+		for _, f := range fields[1:] {
+			if n, err := strconv.Atoi(f); err == nil && n > 0 {
+				if strings.Contains(name, ".") || strings.Contains(name, "@") {
+					counts[name] += n
+				}
+				break
+			}
+		}
+	}
+	return topCounters(counts, limit)
 }
 
 func applyKumoLogStats(res *ServerStatusDTO, content string) {
@@ -240,6 +322,14 @@ func applyKumoLogStats(res *ServerStatusDTO, content string) {
 	reasonDomains := map[string]map[string]int{}
 	reasonSamples := map[string]string{}
 	seenDomains := map[string]struct{}{}
+
+	// v0.2.33：临时失败（Deferred）也分类
+	defReasonCounts := map[string]int{}
+	defReasonDomains := map[string]map[string]int{}
+	defReasonSamples := map[string]string{}
+
+	// v0.2.33：收集最近真实 SMTP 响应样本（Bounce + Deferred）
+	var allReplies []SmtpReplySample
 
 	sc := bufio.NewScanner(strings.NewReader(content))
 	sc.Buffer(make([]byte, 1024*1024), 4*1024*1024)
@@ -275,8 +365,39 @@ func applyKumoLogStats(res *ServerStatusDTO, content string) {
 			if reasonSamples[reason] == "" {
 				reasonSamples[reason] = truncate(ev.Response.Content, 180)
 			}
+			if ev.Response.Code > 0 || ev.Response.Content != "" {
+				allReplies = append(allReplies, SmtpReplySample{
+					Time:      kumoTimestamp(ev.Timestamp),
+					Domain:    domain,
+					Recipient: maskRecipient(ev.Recipient),
+					Kind:      "Bounce",
+					Code:      ev.Response.Code,
+					Content:   truncate(ev.Response.Content, 240),
+				})
+			}
 		case "TransientFailure":
 			res.Deferred++
+			reason := parser.ClassifyKumoBounce(ev.Response.Code, ev.Response.Content)
+			defReasonCounts[reason]++
+			if defReasonDomains[reason] == nil {
+				defReasonDomains[reason] = map[string]int{}
+			}
+			if domain != "" {
+				defReasonDomains[reason][domain]++
+			}
+			if defReasonSamples[reason] == "" {
+				defReasonSamples[reason] = truncate(ev.Response.Content, 180)
+			}
+			if ev.Response.Code > 0 || ev.Response.Content != "" {
+				allReplies = append(allReplies, SmtpReplySample{
+					Time:      kumoTimestamp(ev.Timestamp),
+					Domain:    domain,
+					Recipient: maskRecipient(ev.Recipient),
+					Kind:      "Deferred",
+					Code:      ev.Response.Code,
+					Content:   truncate(ev.Response.Content, 240),
+				})
+			}
 		}
 	}
 	res.UniqueDomains = len(seenDomains)
@@ -292,6 +413,45 @@ func applyKumoLogStats(res *ServerStatusDTO, content string) {
 	sort.Slice(res.BounceReasons, func(i, j int) bool {
 		return res.BounceReasons[i].Count > res.BounceReasons[j].Count
 	})
+	for reason, count := range defReasonCounts {
+		res.DeferredReasons = append(res.DeferredReasons, ServerReasonDTO{
+			Reason:     reason,
+			Count:      count,
+			TopDomains: topCounters(defReasonDomains[reason], 5),
+			Sample:     defReasonSamples[reason],
+		})
+	}
+	sort.Slice(res.DeferredReasons, func(i, j int) bool {
+		return res.DeferredReasons[i].Count > res.DeferredReasons[j].Count
+	})
+	// 按时间倒序，取最近 30 条响应原话样本
+	sort.Slice(allReplies, func(i, j int) bool { return allReplies[i].Time > allReplies[j].Time })
+	if len(allReplies) > 30 {
+		allReplies = allReplies[:30]
+	}
+	res.RecentSmtpReplies = allReplies
+}
+
+// kumoTimestamp 把 KumoMTA 日志的 unix 秒时间戳转成本地 HH:MM:SS
+func kumoTimestamp(unix int64) string {
+	if unix <= 0 {
+		return ""
+	}
+	return time.Unix(unix, 0).Format("15:04:05")
+}
+
+// maskRecipient 把收件人脱敏（保留前 3 字符 + ***@domain）
+func maskRecipient(r string) string {
+	r = strings.TrimSpace(r)
+	at := strings.LastIndex(r, "@")
+	if at < 0 {
+		return r
+	}
+	local := r[:at]
+	if len(local) <= 3 {
+		return local + "***" + r[at:]
+	}
+	return local[:3] + "***" + r[at:]
 }
 
 func eventDomain(ev kumoStatusEvent) string {

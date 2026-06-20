@@ -157,6 +157,71 @@ export default function ServerStatus() {
                   </div>
                 )}
               </Panel>
+
+              <Panel title="临时失败原因 (Deferred 4xx)">
+                <div className="text-xs text-slate-500 mb-2">这些是导致队列堆积的真正原因——对方暂时拒收，KumoMTA 在排队重试</div>
+                {(status.deferred_reasons || []).length === 0 ? (
+                  <Empty text="最近日志里没有临时失败" />
+                ) : (
+                  <div className="space-y-3">
+                    {(status.deferred_reasons || []).map((r: any) => (
+                      <div key={r.reason} className="border border-amber-500/30 rounded-md p-3 bg-amber-500/5">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="font-medium text-slate-200">{r.reason}</div>
+                          <div className="font-mono text-amber-300">{r.count}</div>
+                        </div>
+                        {r.sample && <div className="text-xs text-slate-400 mt-1 break-all">{r.sample}</div>}
+                        {(r.top_domains || []).length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {r.top_domains.map((d: any) => <Chip key={d.name} text={`${d.name} ${d.count}`} />)}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Panel>
+
+              <Panel title="最近 SMTP 响应原文（对方服务器返回原话）">
+                <div className="text-xs text-slate-500 mb-2">看对方 SMTP 服务器到底说了什么，比统计更直接定位问题</div>
+                {(status.recent_smtp_replies || []).length === 0 ? (
+                  <Empty text="最近日志里没有 SMTP 响应记录" />
+                ) : (
+                  <div className="space-y-2 max-h-[460px] overflow-auto font-mono text-xs">
+                    {(status.recent_smtp_replies || []).map((r: any, idx: number) => (
+                      <div key={idx} className={`border rounded-md p-2 ${r.kind === 'Bounce' ? 'border-red-500/30 bg-red-500/5' : 'border-amber-500/30 bg-amber-500/5'}`}>
+                        <div className="flex items-center gap-2 mb-1 text-[11px]">
+                          <span className="text-slate-400">{r.time || '-'}</span>
+                          <span className={`px-1.5 py-0.5 rounded ${r.kind === 'Bounce' ? 'bg-red-500/20 text-red-300' : 'bg-amber-500/20 text-amber-300'}`}>{r.kind}</span>
+                          {r.code > 0 && <span className="px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">{r.code}</span>}
+                          <span className="text-slate-400">{r.domain || '-'}</span>
+                          <span className="text-slate-500 truncate">{r.recipient || '-'}</span>
+                        </div>
+                        <div className="text-slate-300 break-all leading-relaxed">{r.content}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Panel>
+
+              <Panel title="kcli queue-summary（队列堵塞实时快照）">
+                {(status.top_queue_domains || []).length > 0 && (
+                  <div className="mb-3">
+                    <div className="text-xs text-slate-500 mb-2">队列堆积 Top 域名（按当前 ScheduledQueue 长度）</div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {(status.top_queue_domains || []).map((d: any) => (
+                        <div key={d.name} className="flex items-center justify-between bg-rose-500/10 border border-rose-500/30 rounded-md px-3 py-2 text-sm">
+                          <span className="text-slate-200">{d.name}</span>
+                          <span className="font-mono text-rose-300">{d.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {status.queue_summary
+                  ? <pre className="bg-slate-900/60 rounded-md p-3 text-xs text-slate-300 overflow-auto max-h-[400px] whitespace-pre-wrap">{status.queue_summary}</pre>
+                  : <Empty text="kcli queue-summary 无输出（可能 kcli 不在标准路径）" />}
+              </Panel>
             </div>
 
             <div className="space-y-5">

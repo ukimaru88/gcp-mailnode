@@ -1,7 +1,7 @@
 # gcp-mailnode - 项目档案
 
 > 最后更新：2026-06-11
-> 当前版本：**v0.2.32**（`version.txt`；拆 Spamhaus ZEN，跳过 PBL 一刀切）
+> 当前版本：**v0.2.33**（`version.txt`；连接服务器加深度诊断 4 板块）
 > 续接触发词："继续 gcp-mailnode" / "继续 GCP" / "继续节点"
 > 跨项目共享记忆：`D:\CLAUDE_MEMORY\`
 > 凭据：`D:\CLAUDE_MEMORY\credentials.md`
@@ -147,7 +147,8 @@ D:\gcp-mailnode\
 
 | 版本 | 改动 |
 |---|---|
-| **v0.2.32** | 最新。**拆 Spamhaus ZEN，跳过 PBL**：用户反馈"Spamhaus ZEN 选上不对"——筛到的 IP 136.110.56.58 实测在 SBL/XBL/CSS/Barracuda/SpamCop 全 NXDOMAIN，只 zen.spamhaus.org 返回 127.0.0.11（=PBL Spamhaus）。PBL 把所有云 IP 段一刀切列入（GCP/AWS/Azure 几乎所有静态 IP 都中），Gmail/Outlook/Yahoo 等大邮箱不查 PBL，对实际投递无影响。改动：dnsbl.go DefaultZones 删 `zen.spamhaus.org`，加 `sbl.spamhaus.org`（精准 spam）+ `xbl.spamhaus.org`（病毒/僵尸网络）+ `drop.spamhaus.org`（高危段）；CSS 不动（独立精准）。这样真命中 SBL/XBL/CSS/DROP 仍剔除，PBL 不再误判 |
+| **v0.2.33** | 最新。**「连接服务器」加深度诊断**：用户反馈 26863 队列堵塞但只看到 Bounce 5xx 统计不知道为什么堵。新增 4 个 Panel：① 临时失败原因 (Deferred 4xx) 分类 + Top 域名（区别 Bounce，看真正堵塞原因） ② 最近 30 条 SMTP 响应原文（带时间/域名/收件人脱敏，看对方服务器返回原话）③ kcli queue-summary 队列堵塞 Top 域名（实时快照不是日志统计）④ queue-summary 原文。后端 ServerStatusDTO 加 DeferredReasons / RecentSmtpReplies / QueueSummary / TopQueueDomains；serverStatusCommand 加 kcli 路径自动发现（/opt/kumomta/{sbin,bin}/ + PATH） + base64 传输避免特殊字符破坏 KV 解析；applyKumoLogStats 加 TransientFailure 事件分类 + 收集真实 SMTP 响应。kumoTimestamp + maskRecipient 工具函数。前端 ServerStatus.tsx 加 3 个 Panel（临时失败琥珀色、SMTP 响应原文按 Bounce/Deferred 着色、队列堵塞 Top 玫红色）。前后端编译 0 错，打包 |
+| v0.2.32 | **拆 Spamhaus ZEN，跳过 PBL**：用户反馈"Spamhaus ZEN 选上不对"——筛到的 IP 136.110.56.58 实测在 SBL/XBL/CSS/Barracuda/SpamCop 全 NXDOMAIN，只 zen.spamhaus.org 返回 127.0.0.11（=PBL Spamhaus）。PBL 把所有云 IP 段一刀切列入（GCP/AWS/Azure 几乎所有静态 IP 都中），Gmail/Outlook/Yahoo 等大邮箱不查 PBL，对实际投递无影响。改动：dnsbl.go DefaultZones 删 `zen.spamhaus.org`，加 `sbl.spamhaus.org`（精准 spam）+ `xbl.spamhaus.org`（病毒/僵尸网络）+ `drop.spamhaus.org`（高危段）；CSS 不动（独立精准）。这样真命中 SBL/XBL/CSS/DROP 仍剔除，PBL 不再误判 |
 | v0.2.31 | **两项修复 + 一键修复功能**：① **BatchSetPTR 加 sem 限 5 并发**：之前 30 台无限并发跑 delete+add AccessConfig，GCP API 报 DONE 但实际静态 IP 没绑回去 → VM 拿到 ephemeral IP → 阿里云 DNS 仍指向静态 IP → 12/30 台连不上。stages.go:1158 仿 StartMTADeploy 加 `sem := make(chan struct{}, 5)` 限并发。② **新增 RepairBatchPTR 函数 + 一键修复 PTR 按钮**：扫所有 VPS（或勾选的）→ GetInstance 拿当前 external IP → 跟 DB.ip 对比 → 不一致的低并发（sem=5）SetInstancePTRForNIC 强绑回静态 IP → 报告"正常 X / 修复 Y / 失败 Z / 跳过 W"。Resources.tsx 加红色 🚑 按钮（不勾选=扫全部）。前后端编译 0 错 + 已打包 |
 | v0.2.30 | **v0.2.25 buildDomainIPMap 行为修正**：用户报"每域 VPS 数=1 但 UI 仍生成 mail1.xxx.com"。根因 buildDomainIPMap 条件 `per === 1 && pattern === '@'` 错误——pattern 默认 `mail{N}` 不等于 `@`，所以 per=1 也会走 pattern 展开路径，生成 mail1.根域 而非用户预期的根域本身。改为 `if (per === 1) fqdn = root`（永远直接用根域，不读 pattern），跟 v0.2.24 行为完全一致。同时修文案"10 个根域 × 3 = 30 个 FQDN"硬编码值为动态 `nRoots × per` |
 | v0.2.29 | **两项修复**：① **Stage A 误报 0/N**：用户报 v0.2.24 实测 Stage A 真的筛到 20 个 IP（Stage B 也成功开机 20 台），但收尾日志却说"筛到 0/20"。根因 Stage A 主流程 `wg.Wait() → Drain (28 秒) → 收尾统计`，但 Drain 期间用户已点击 Stage B，StartStageB 共享同一 batchState 并 `atomic.StoreInt64(&state.succeeded, 0)` 重置；Stage A 后续 atomic.Load 读到 0。修复：把 got/used 在 wg.Wait 之后**立即固化到局部变量**，后续日志全用局部值。② **关 v0.2.26 自动填满**：用户反馈"自动子域名不好用"——自动 ceil(VPS/根域) 干扰用户预期。回到手动模式，vpsPerDomain 默认 1，用户主动改才展开 mail1/mail2/...（v0.2.25 功能保留，只是默认不触发） |
