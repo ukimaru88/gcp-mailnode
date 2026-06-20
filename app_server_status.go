@@ -163,10 +163,11 @@ for p in /opt/kumomta/sbin/kcli /opt/kumomta/bin/kcli /usr/bin/kcli /usr/local/b
 done
 if [ -n "$KCLI" ]; then
   qs=$("$KCLI" queue-summary 2>&1 | head -100)
-  # 用 base64 避免特殊字符破坏 kv 解析
-  printf 'queue_summary_b64=%s\n' "$(printf '%%s' "$qs" | base64 -w0 2>/dev/null)"
+  # v0.2.34：用 base64 避免特殊字符破坏 kv 解析；用 printf '%s' 而非 '%%s'
+  # （这是 raw string 不经 fmt.Sprintf，'%%s' 在 shell 里是字面 '%s' 不替换 $qs）
+  printf 'queue_summary_b64=%s\n' "$(printf '%s' "$qs" | base64 -w0 2>/dev/null)"
 else
-  printf 'queue_summary_b64=%s\n' "$(printf 'kcli not found in PATH or /opt/kumomta/{sbin,bin}/' | base64 -w0)"
+  printf 'queue_summary_b64=%s\n' "$(printf '%s' 'kcli not found in PATH or /opt/kumomta/{sbin,bin}/' | base64 -w0)"
 fi
 `
 }
