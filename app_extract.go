@@ -164,29 +164,61 @@ func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (Extra
 				Username:   "root",
 				KeyContent: string(sshkey.PrivatePEM()),
 			}
-			content, cursor, err := ssh.ReadKumoMTALogs(ctx, cfg, "/var/log/kumomta/", "")
+
+			// v0.2.35：按 deploy_type 分支——Postfix 走 syslog，KumoMTA 走 zstd JSON
+			var content, cursor string
+			var err error
+			if v.deployType == "postfix" {
+				// Postfix 日志在 /var/log/mail.log（syslog 文本格式）
+				// 兜底 journalctl -u postfix（某些 Debian 12 minimal 没装 rsyslog）
+				content, err = ssh.RunCommand(ctx, cfg, `set +e
+if [ -s /var/log/mail.log ]; then
+  cat /var/log/mail.log
+  for f in /var/log/mail.log.1 /var/log/mail.log.2; do
+    [ -f "$f" ] && cat "$f"
+  done
+  for f in /var/log/mail.log.*.gz; do
+    [ -f "$f" ] && zcat "$f" 2>/dev/null
+  done
+else
+  journalctl -u postfix --no-pager --since '7 days ago' 2>/dev/null
+fi`)
+				if err == nil {
+					res.Lines = strings.Count(content, "\n")
+					pr := parser.ParseMailLog(content)
+					res.Parsed = pr.SentLines + pr.BouncedLines + pr.DeferredLines
+					res.Emails = len(pr.Emails)
+					mu.Lock()
+					allEmails = append(allEmails, pr.Emails...)
+					mu.Unlock()
+				}
+				// Postfix 暂不支持 deleteAfter（syslog 不能按 cursor 删，需 logrotate 配合）
+			} else {
+				// KumoMTA 走原路径
+				content, cursor, err = ssh.ReadKumoMTALogs(ctx, cfg, "/var/log/kumomta/", "")
+				if err == nil {
+					res.Lines = strings.Count(content, "\n")
+					pr := parser.ParseKumoMTAStream(strings.NewReader(content))
+					res.Parsed = pr.SentLines + pr.BouncedLines + pr.DeferredLines
+					res.Emails = len(pr.Emails)
+					mu.Lock()
+					allEmails = append(allEmails, pr.Emails...)
+					if deleteAfter && cursor != "" {
+						cleanupList = append(cleanupList, cleanupEntry{vpsID: v.id, name: v.name, cfg: cfg, cursor: cursor})
+					}
+					mu.Unlock()
+				}
+			}
 			if err != nil {
 				res.Error = err.Error()
 				results[i] = res
 				logger.Warn("[extract %s] %s SSH 拉日志失败: %v", batchID, v.name, err)
 				return
 			}
-			res.Lines = strings.Count(content, "\n")
-
-			pr := parser.ParseKumoMTAStream(strings.NewReader(content))
-			res.Parsed = pr.SentLines + pr.BouncedLines + pr.DeferredLines
-			res.Emails = len(pr.Emails)
-
-			mu.Lock()
-			allEmails = append(allEmails, pr.Emails...)
-			if deleteAfter && cursor != "" {
-				cleanupList = append(cleanupList, cleanupEntry{vpsID: v.id, name: v.name, cfg: cfg, cursor: cursor})
-			}
-			mu.Unlock()
 
 			results[i] = res
-			logger.Info("[extract %s] %s lines=%d parsed=%d emails=%d cursor=%s",
-				batchID, v.name, res.Lines, res.Parsed, res.Emails, cursor)
+			logger.Info("[extract %s] %s type=%s lines=%d parsed=%d emails=%d cursor=%s",
+				batchID, v.name, v.deployType, res.Lines, res.Parsed, res.Emails, cursor)
 		}()
 	}
 	wg.Wait()
@@ -403,9 +435,9 @@ func (a *App) runScheduledExtract(cfg ExtractScheduleConfig) {
 		return
 	}
 
-	// 拉所有可提取的 KumoMTA VPS（deploy_type=kumomta + deploy_status 在 success/mta_ready/ptr_ready + status!=deleted + 有 IP）
+	// v0.2.35：KumoMTA + Postfix 都拉（之前只拉 kumomta，postfix 节点连自动调度都进不去）
 	rows, err := db.Query(`SELECT id FROM vps_instances
-	                       WHERE COALESCE(deploy_type,'kumomta')='kumomta'
+	                       WHERE COALESCE(deploy_type,'kumomta') IN ('kumomta','postfix')
 	                         AND COALESCE(status,'') != 'deleted'
 	                         AND COALESCE(ip,'') != ''
 	                         AND COALESCE(deploy_status,'') IN ('success','mta_ready','ptr_ready')`)
