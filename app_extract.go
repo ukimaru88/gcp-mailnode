@@ -77,13 +77,28 @@ func (a *App) GetExtractOutputDir() (string, error) {
 // v0.1.77：本入口默认不删服务器日志（向后兼容旧调用方）；
 // 自动调度走 ExtractFromVPSWithDelete（deleteAfter=true）。
 func (a *App) ExtractFromVPS(vpsIDs []string) (ExtractSummary, error) {
-	return a.ExtractFromVPSWithDelete(vpsIDs, false)
+	return a.extractCore(vpsIDs, false, "")
 }
 
 // ExtractFromVPSWithDelete 同 ExtractFromVPS，但 deleteAfter=true 时提取成功后调用 DeleteKumoMTALogsBefore
 // 删除服务器上 ≤ cursor 的所有日志（包括成功+失败的，已读到本地的就不再保留）。
 // 安全：只在写本地文件成功后才删；当台 VPS SSH 失败 / 解析失败 / 写文件失败时不删，下次还能重读。
 func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (ExtractSummary, error) {
+	return a.extractCore(vpsIDs, deleteAfter, "")
+}
+
+// ExtractFromVPSForceType v0.2.37：手动指定 deploy_type 覆盖数据库字段。
+// 用于老节点（v0.2.10 之前部署）数据库 deploy_type 字段不正确的场景。
+// forceType: "" = 用 DB 字段；"kumomta" / "postfix" = 强制覆盖。
+func (a *App) ExtractFromVPSForceType(vpsIDs []string, deleteAfter bool, forceType string) (ExtractSummary, error) {
+	ft := strings.ToLower(strings.TrimSpace(forceType))
+	if ft != "" && ft != "kumomta" && ft != "postfix" {
+		return ExtractSummary{}, fmt.Errorf("forceType 只能是 'kumomta' / 'postfix' / 空，收到: %s", forceType)
+	}
+	return a.extractCore(vpsIDs, deleteAfter, ft)
+}
+
+func (a *App) extractCore(vpsIDs []string, deleteAfter bool, forceType string) (ExtractSummary, error) {
 	ctx := a.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -147,7 +162,13 @@ func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (Extra
 
 			res := ExtractResult{VPSID: v.id, Name: v.name, IP: v.ip}
 
-			if v.deployType == "mailcow" {
+			// v0.2.37：forceType 强制覆盖（用于老节点 DB deploy_type 字段不对）
+			effType := v.deployType
+			if forceType != "" {
+				effType = forceType
+			}
+
+			if effType == "mailcow" {
 				res.Error = "mailcow 节点暂不支持提取（需另行实现）"
 				results[i] = res
 				return
@@ -166,9 +187,10 @@ func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (Extra
 			}
 
 			// v0.2.35：按 deploy_type 分支——Postfix 走 syslog，KumoMTA 走 zstd JSON
+			// v0.2.37：effType 来自 forceType 覆盖或 DB 字段
 			var content, cursor string
 			var err error
-			if v.deployType == "postfix" {
+			if effType == "postfix" {
 				// Postfix 日志在 /var/log/mail.log（syslog 文本格式）
 				// v0.2.36：journalctl 兜底必须用 -t SYSLOG_IDENTIFIER 拿 postfix 子进程
 				// 之前 v0.2.35 用 `-u postfix` 错——Postfix 不是 systemd unit 直接输出
@@ -225,8 +247,8 @@ fi`)
 			}
 
 			results[i] = res
-			logger.Info("[extract %s] %s type=%s lines=%d parsed=%d emails=%d cursor=%s",
-				batchID, v.name, v.deployType, res.Lines, res.Parsed, res.Emails, cursor)
+			logger.Info("[extract %s] %s type=%s(eff=%s) lines=%d parsed=%d emails=%d cursor=%s",
+				batchID, v.name, v.deployType, effType, res.Lines, res.Parsed, res.Emails, cursor)
 		}()
 	}
 	wg.Wait()

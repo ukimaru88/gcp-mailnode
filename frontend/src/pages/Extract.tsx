@@ -6,6 +6,8 @@ import {
   ExtractFromVPS,
   // @ts-ignore
   ExtractFromVPSWithDelete,
+  // @ts-ignore - v0.2.37 新接口
+  ExtractFromVPSForceType,
   // @ts-ignore
   GetExtractOutputDir,
   // @ts-ignore
@@ -65,8 +67,12 @@ export default function Extract() {
   const [schedule, setSchedule] = useState<ScheduleCfg>({ enabled: false, interval_min: 15, delete_after: true })
   const [scheduleSaving, setScheduleSaving] = useState(false)
 
+  // v0.2.37：手动覆盖 deploy_type（用于老节点数据库字段不正确的场景）
+  // true = KumoMTA，false = Postfix
+  const [isKumoMTA, setIsKumoMTA] = useState(true)
+
   const isExtractableVPS = (v: main.VPSInstanceDTO) =>
-    v.deploy_type === 'kumomta' &&
+    (v.deploy_type === 'kumomta' || v.deploy_type === 'postfix' || !v.deploy_type) &&
     v.status !== 'deleted' &&
     !!v.ip &&
     ['success', 'mta_ready', 'ptr_ready'].includes(v.deploy_status || '')
@@ -135,9 +141,11 @@ export default function Extract() {
     setRunning(true)
     setSummary(null)
     try {
-      const r = await ExtractFromVPSWithDelete(Array.from(selected), deleteAfter) as ExtractSummary
+      // v0.2.37：强制指定 deploy_type（覆盖数据库字段）
+      const forceType = isKumoMTA ? 'kumomta' : 'postfix'
+      const r = await ExtractFromVPSForceType(Array.from(selected), deleteAfter && isKumoMTA, forceType) as ExtractSummary
       setSummary(r)
-      const tip = deleteAfter ? '（已删除服务器日志）' : ''
+      const tip = (deleteAfter && isKumoMTA) ? '（已删除服务器日志）' : (!isKumoMTA ? '（Postfix 节点不支持删日志）' : '')
       toast('success', `提取完成：跨 VPS 唯一邮箱 ${r.total_emails}${tip}`)
     } catch (e: any) {
       toast('error', '提取失败: ' + (e?.message || e))
@@ -171,11 +179,25 @@ export default function Extract() {
           <span className="text-xs text-slate-500 ml-2">仅导出"成功投递（Delivery 250 OK）"的收件人，Bounce/Deferred 不输出</span>
         </div>
         <div className="inline-flex gap-2 items-center">
-          <label className="inline-flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none px-2 py-1.5 bg-slate-800/60 rounded-md border border-slate-700/40"
-                 title="提取成功后调用 SSH 删除 ≤ 已读 cursor 的所有日志文件（包括成功+失败），保留正在写入的最新文件">
-            <input type="checkbox" className="accent-rose-500" checked={deleteAfter} onChange={e => setDeleteAfter(e.target.checked)} />
-            <Trash2 size={12} className={deleteAfter ? 'text-rose-400' : 'text-slate-500'} />
-            提取后删服务器日志
+          {/* v0.2.37：搭建方式开关——强制覆盖 deploy_type（用于老节点 DB 字段不对的场景） */}
+          <label className="inline-flex items-center gap-2 text-xs cursor-pointer select-none px-2 py-1.5 bg-slate-800/60 rounded-md border border-slate-700/40"
+                 title="老节点数据库 deploy_type 字段可能不正确——此开关强制覆盖（不读 DB 字段）。开=按 KumoMTA 提取，关=按 Postfix 提取">
+            <span className={isKumoMTA ? 'text-indigo-300 font-medium' : 'text-slate-500'}>KumoMTA</span>
+            <button
+              type="button"
+              onClick={() => setIsKumoMTA(!isKumoMTA)}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${isKumoMTA ? 'bg-indigo-600' : 'bg-amber-600'}`}
+              aria-label="切换 KumoMTA / Postfix"
+            >
+              <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${isKumoMTA ? 'translate-x-5' : 'translate-x-1'}`} />
+            </button>
+            <span className={!isKumoMTA ? 'text-amber-300 font-medium' : 'text-slate-500'}>Postfix</span>
+          </label>
+          <label className={`inline-flex items-center gap-1.5 text-xs cursor-pointer select-none px-2 py-1.5 bg-slate-800/60 rounded-md border border-slate-700/40 ${!isKumoMTA ? 'opacity-40' : ''}`}
+                 title={!isKumoMTA ? 'Postfix 节点暂不支持自动删 syslog' : '提取成功后调用 SSH 删除 ≤ 已读 cursor 的所有日志文件'}>
+            <input type="checkbox" className="accent-rose-500" disabled={!isKumoMTA} checked={deleteAfter && isKumoMTA} onChange={e => setDeleteAfter(e.target.checked)} />
+            <Trash2 size={12} className={(deleteAfter && isKumoMTA) ? 'text-rose-400' : 'text-slate-500'} />
+            <span className="text-slate-300">提取后删服务器日志</span>
           </label>
           <button onClick={refresh}
                   className="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-3 py-1.5 text-sm inline-flex items-center gap-1.5">

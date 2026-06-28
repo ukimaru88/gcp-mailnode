@@ -45,6 +45,8 @@ export function ExportSMTP(arg1:string):Promise<string>;
 
 export function ExtractFromVPS(arg1:Array<string>):Promise<main.ExtractSummary>;
 
+export function ExtractFromVPSForceType(arg1:Array<string>,arg2:boolean,arg3:string):Promise<main.ExtractSummary>;
+
 export function ExtractFromVPSWithDelete(arg1:Array<string>,arg2:boolean):Promise<main.ExtractSummary>;
 
 export function FixMailNodeTag(arg1:Array<string>):Promise<number>;

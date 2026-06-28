@@ -86,6 +86,10 @@ export function ExtractFromVPS(arg1) {
   return window['go']['main']['App']['ExtractFromVPS'](arg1);
 }
 
+export function ExtractFromVPSForceType(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ExtractFromVPSForceType'](arg1, arg2, arg3);
+}
+
 export function ExtractFromVPSWithDelete(arg1, arg2) {
   return window['go']['main']['App']['ExtractFromVPSWithDelete'](arg1, arg2);
 }
