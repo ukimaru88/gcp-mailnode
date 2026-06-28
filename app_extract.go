@@ -170,7 +170,11 @@ func (a *App) ExtractFromVPSWithDelete(vpsIDs []string, deleteAfter bool) (Extra
 			var err error
 			if v.deployType == "postfix" {
 				// Postfix 日志在 /var/log/mail.log（syslog 文本格式）
-				// 兜底 journalctl -u postfix（某些 Debian 12 minimal 没装 rsyslog）
+				// v0.2.36：journalctl 兜底必须用 -t SYSLOG_IDENTIFIER 拿 postfix 子进程
+				// 之前 v0.2.35 用 `-u postfix` 错——Postfix 不是 systemd unit 直接输出
+				// 而是 master + smtp + smtpd + cleanup + qmgr + bounce 等子进程
+				// 各自通过 syslog 写日志，SYSLOG_IDENTIFIER 是 'postfix/smtp' 这种
+				// status=sent 来自 postfix/smtp，status=bounced 来自 postfix/bounce
 				content, err = ssh.RunCommand(ctx, cfg, `set +e
 if [ -s /var/log/mail.log ]; then
   cat /var/log/mail.log
@@ -181,7 +185,11 @@ if [ -s /var/log/mail.log ]; then
     [ -f "$f" ] && zcat "$f" 2>/dev/null
   done
 else
-  journalctl -u postfix --no-pager --since '7 days ago' 2>/dev/null
+  journalctl --no-pager --since '7 days ago' \
+    -t postfix/smtp -t postfix/smtpd -t postfix/cleanup \
+    -t postfix/bounce -t postfix/error -t postfix/local \
+    -t postfix/qmgr -t postfix/pickup \
+    2>/dev/null
 fi`)
 				if err == nil {
 					res.Lines = strings.Count(content, "\n")

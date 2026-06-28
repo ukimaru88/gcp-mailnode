@@ -256,11 +256,16 @@ else
   sed -i 's|http://[a-z]*\.archive\.ubuntu\.com|http://archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true
 
   log_info "Installing all dependencies"
-  if ! apt-get install -y postfix mailutils sasl2-bin libsasl2-modules opendkim opendkim-tools 2>/dev/null; then
+  # v0.2.36：加 rsyslog——Debian 12 minimal 默认没装，导致 /var/log/mail.log 不存在，
+  # 影响"批量提取发送成功"功能（虽然代码侧已加 journalctl 兜底，但有 mail.log 更稳）
+  if ! apt-get install -y postfix mailutils sasl2-bin libsasl2-modules opendkim opendkim-tools rsyslog 2>/dev/null; then
     log_info "Direct install failed, running apt-get update"
     apt_retry apt-get update
-    apt_retry apt-get install -y postfix mailutils sasl2-bin libsasl2-modules opendkim opendkim-tools
+    apt_retry apt-get install -y postfix mailutils sasl2-bin libsasl2-modules opendkim opendkim-tools rsyslog
   fi
+  # 确保 rsyslog 启动 + 开机自启
+  systemctl enable rsyslog 2>/dev/null || true
+  systemctl start rsyslog 2>/dev/null || true
 fi
 
 # ============================================================
