@@ -157,9 +157,12 @@ func ReadMailLogFull(ctx context.Context, cfg Config, logPath string) (string, i
 
 	if !isS6 {
 		// 普通日志文件（如 /var/log/mail.log），直接读取
+		// v0.2.38：加 `2>/dev/null; exit 0` 兜底——cat 文件不存在/读取失败时
+		// 不让 RunCommand 因退出码非零报错，由上层用 content==\"\" 判空。
 		escaped := strings.ReplaceAll(logPath, "'", "'\\''")
-		content, err := RunCommand(ctx, cfg, fmt.Sprintf("cat '%s'", escaped))
-		if err != nil {
+		content, err := RunCommand(ctx, cfg, fmt.Sprintf("cat '%s' 2>/dev/null; exit 0", escaped))
+		// content 非空就用，即便 err（退出码误报）也不丢数据
+		if strings.TrimSpace(content) == "" && err != nil {
 			return "", 0, fmt.Errorf("读取日志文件失败: %w", err)
 		}
 		size, _ := GetFileSize(ctx, cfg, logPath)
@@ -175,16 +178,20 @@ func ReadMailLogFull(ctx context.Context, cfg Config, logPath string) (string, i
 		dir = "."
 	}
 
+	// v0.2.38：while 循环末尾 cat 若遇文件被 logrotate 删/截会返回非零，
+	// 导致整脚本退出码非零、RunCommand 报错、已拼接的轮转日志被丢。结尾补
+	// `exit 0` 强制成功；调用方再加 content 非空容错双保险。
 	cmd := fmt.Sprintf(
-		"find '%s' -maxdepth 1 -type f | sort | while read f; do cat \"$f\" 2>/dev/null; done",
+		"find '%s' -maxdepth 1 -type f | sort | while read f; do cat \"$f\" 2>/dev/null; done; exit 0",
 		strings.ReplaceAll(dir, "'", "'\\''"),
 	)
 	content, err := RunCommand(ctx, cfg, cmd)
-	if err != nil {
+	// content 非空就用——即便 RunCommand 误报错也不丢已拿到的轮转日志
+	if strings.TrimSpace(content) == "" && err != nil {
 		// fallback: 直接读 current 文件
 		escaped := strings.ReplaceAll(logPath, "'", "'\\''")
-		content, err = RunCommand(ctx, cfg, fmt.Sprintf("cat '%s' 2>/dev/null", escaped))
-		if err != nil {
+		content, err = RunCommand(ctx, cfg, fmt.Sprintf("cat '%s' 2>/dev/null; exit 0", escaped))
+		if strings.TrimSpace(content) == "" && err != nil {
 			return "", 0, fmt.Errorf("全量读取日志失败: %w", err)
 		}
 	}

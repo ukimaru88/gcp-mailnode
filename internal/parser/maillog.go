@@ -119,6 +119,14 @@ func parsePostfix(lines []string, result *ParseResult, seen map[string]struct{})
 
 		// status=sent → 提取邮箱
 		if postfixSentRe.MatchString(line) {
+			// v0.2.38：排除 relay=local —— 本地 maildir 投递不是真正对外发送成功。
+			// Postfix 每收到一封外部退信，会产生一条退信回执投递到 info@本域
+			// （relay=local, status=sent, delivered to maildir）。若不排除，提取
+			// 结果会被自己域名的 info@xxx 大量污染（甚至盖过真实收件人）。
+			// 只有 relay=外部MX 的 sent 才是真·发送成功的目标地址。
+			if strings.Contains(line, "relay=local") {
+				continue
+			}
 			result.SentLines++
 			m := postfixToRe.FindStringSubmatch(line)
 			if len(m) >= 2 {

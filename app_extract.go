@@ -197,6 +197,10 @@ func (a *App) extractCore(vpsIDs []string, deleteAfter bool, forceType string) (
 				// 而是 master + smtp + smtpd + cleanup + qmgr + bounce 等子进程
 				// 各自通过 syslog 写日志，SYSLOG_IDENTIFIER 是 'postfix/smtp' 这种
 				// status=sent 来自 postfix/smtp，status=bounced 来自 postfix/bounce
+				// v0.2.38：脚本结尾必须 exit 0。之前最后一条 `for f in *.gz` 循环
+				// 在没有 .gz 文件时 `[ -f "字面glob" ]` 返回 1，整个脚本退出码=1
+				// （set +e 不改最终退出码），RunCommand 判失败把已拿到的完整日志全丢了。
+				// 用户那台节点有 /var/log/mail.log 且含 status=sent，纯被退出码坑。
 				content, err = ssh.RunCommand(ctx, cfg, `set +e
 if [ -s /var/log/mail.log ]; then
   cat /var/log/mail.log
@@ -212,8 +216,11 @@ else
     -t postfix/bounce -t postfix/error -t postfix/local \
     -t postfix/qmgr -t postfix/pickup \
     2>/dev/null
-fi`)
-				if err == nil {
+fi
+exit 0`)
+				// v0.2.38 双保险：即使 RunCommand 报错（退出码非零），只要 content 里
+				// 有数据就照样解析——纯读日志，stdout 有内容就够用，不依赖退出码。
+				if strings.TrimSpace(content) != "" {
 					res.Lines = strings.Count(content, "\n")
 					pr := parser.ParseMailLog(content)
 					res.Parsed = pr.SentLines + pr.BouncedLines + pr.DeferredLines
@@ -221,6 +228,7 @@ fi`)
 					mu.Lock()
 					allEmails = append(allEmails, pr.Emails...)
 					mu.Unlock()
+					err = nil // content 有数据，清掉退出码误报
 				}
 				// Postfix 暂不支持 deleteAfter（syslog 不能按 cursor 删，需 logrotate 配合）
 			} else {
